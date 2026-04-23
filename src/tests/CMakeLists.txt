@@ -42,6 +42,12 @@ target_include_directories(amber-test-effects PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(amber-test-effects PRIVATE amber-engine Qt6::Test)
 add_test(NAME amber-test-effects COMMAND amber-test-effects)
 
+# Regression test for XML shader-effect field parsing (guards FONT/STRING/FILE dispatch)
+add_executable(amber-test-effect-xml-parse test_effect_xml_parse.cpp ${AMBER_TEST_STUBS})
+target_include_directories(amber-test-effect-xml-parse PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(amber-test-effect-xml-parse PRIVATE amber-engine Qt6::Test)
+add_test(NAME amber-test-effect-xml-parse COMMAND amber-test-effect-xml-parse)
+
 add_executable(amber-test-projectio test_projectio.cpp ${AMBER_TEST_STUBS})
 target_include_directories(amber-test-projectio PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(amber-test-projectio PRIVATE amber-engine Qt6::Test)
