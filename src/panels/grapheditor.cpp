@@ -169,8 +169,10 @@ void GraphEditor::set_row(EffectRow *r) {
   for (int i=0;i<field_sliders_.size();i++) {
     delete field_sliders_.at(i);
     delete field_enable_buttons.at(i);
+    delete field_widgets_.at(i);
   }
   field_sliders_.clear();
+  field_widgets_.clear();
   field_enable_buttons.clear();
 
   if (row != nullptr) {
@@ -200,6 +202,7 @@ void GraphEditor::set_row(EffectRow *r) {
         LabelSlider* slider = static_cast<LabelSlider*>(fw->CreateWidget());
         slider->SetColor(get_curve_color(i, r->FieldCount()).name());
         field_sliders_.append(slider);
+        field_widgets_.append(fw);
         value_layout->addWidget(slider);
 
         found_vals = true;
