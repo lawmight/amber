@@ -22,7 +22,6 @@
 
 #include <QHBoxLayout>
 #include <QPushButton>
-#include <QMessageBox>
 
 #include "engine/undo/undo.h"
 #include "engine/undo/undostack.h"
@@ -30,8 +29,6 @@
 #include "engine/sequence.h"
 #include "core/appcontext.h"
 #include "effect.h"
-#include "ui/keyframenavigator.h"
-#include "ui/clickablelabel.h"
 
 EffectRow::EffectRow(Effect *parent, const QString &n, bool savable, bool keyframable) :
   QObject(parent),
@@ -96,11 +93,9 @@ void EffectRow::SetKeyframingEnabled(bool enabled) {
   } else {
 
     // Confirm with the user whether they really want to disable keyframing
-    if (QMessageBox::question(nullptr,
-                              tr("Disable Keyframes"),
-                              tr("Disabling keyframes will delete all current keyframes. "
-                                 "Are you sure you want to do this?"),
-                              QMessageBox::Yes, QMessageBox::No) == QMessageBox::Yes) {
+    if (amber::app_ctx->showQuestion(tr("Disable Keyframes"),
+                                     tr("Disabling keyframes will delete all current keyframes. "
+                                        "Are you sure you want to do this?"))) {
 
       ComboAction* ca = new ComboAction(tr("Disable Keyframes"));
 

@@ -21,11 +21,11 @@
 #ifndef EXPORTTHREAD_H
 #define EXPORTTHREAD_H
 
-#include <atomic>
-#include <QThread>
 #include <QMutex>
 #include <QOffscreenSurface>
+#include <QThread>
 #include <QWaitCondition>
+#include <atomic>
 
 struct AVFormatContext;
 struct AVCodecContext;
@@ -35,6 +35,8 @@ struct AVStream;
 struct AVCodec;
 struct SwsContext;
 struct SwrContext;
+class Sequence;
+class RenderThread;
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -72,8 +74,8 @@ struct VideoCodecParams {
 
 class ExportThread : public QThread {
   Q_OBJECT
-public:
-  ExportThread(const ExportParams& params, const VideoCodecParams& vparams, QObject* parent = nullptr);
+ public:
+  ExportThread(Sequence* seq, const ExportParams& params, const VideoCodecParams& vparams, QObject* parent = nullptr);
   void run() override;
 
   // Pre-created GL fallback surface (created on GUI thread, passed through to
@@ -83,21 +85,29 @@ public:
   const QString& GetError();
 
   bool WasInterrupted();
-signals:
+ signals:
   void ProgressChanged(int value, qint64 remaining_ms);
-public slots:
+ public slots:
   void Interrupt();
 
   void play_wake();
-private:
+
+ private:
   bool Encode(AVFormatContext* ofmt_ctx, AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* packet, AVStream* stream);
   bool SetupVideo();
   bool SetupAudio();
   bool SetupContainer();
   void Export();
   void Cleanup();
+  bool EncodeVideoFrame(RenderThread* renderer, double timecode_secs);
+  bool EncodeAudioFrames(long& file_audio_samples, double timecode_secs);
+  bool EncodeAllFrames(RenderThread* renderer, long& file_audio_samples);
+  bool FlushSwrAudio(long& file_audio_samples);
+  void FlushEncoders();
 
   std::atomic<bool> interrupt_;
+
+  Sequence* seq_;
 
   // params imported from dialogs
   ExportParams params_;
@@ -131,8 +141,8 @@ private:
 
   std::atomic<bool> waiting_for_audio_;
   QOffscreenSurface* gl_fallback_surface_{nullptr};
-private slots:
+ private slots:
   void wake();
 };
 
-#endif // EXPORTTHREAD_H
+#endif  // EXPORTTHREAD_H

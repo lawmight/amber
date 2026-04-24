@@ -21,20 +21,21 @@
 #ifndef TIMELINEWIDGET_H
 #define TIMELINEWIDGET_H
 
+#include <QApplication>
+#include <QPainter>
+#include <QScreen>
+#include <QScrollBar>
 #include <QTimer>
 #include <QWidget>
-#include <QScrollBar>
-#include <QPainter>
-#include <QApplication>
-#include <QScreen>
 
-#include "engine/sequence.h"
 #include "engine/clip.h"
+#include "engine/sequence.h"
+#include "engine/undo/undo.h"
 #include "project/footage.h"
 #include "project/media.h"
-#include "engine/undo/undo.h"
 #include "timelinetools.h"
 
+class Menu;
 class Timeline;
 
 struct TimelineTrackHeight {
@@ -43,35 +44,37 @@ struct TimelineTrackHeight {
 };
 
 bool same_sign(int a, int b);
-void draw_waveform(ClipPtr clip, const FootageStream *ms, long media_length, QPainter* p, const QRect& clip_rect, int waveform_start, int waveform_limit, double zoom);
+void draw_waveform(ClipPtr clip, const FootageStream* ms, long media_length, QPainter* p, const QRect& clip_rect,
+                   int waveform_start, int waveform_limit, double zoom);
 
 class TimelineWidget : public QWidget {
   Q_OBJECT
-public:
-  explicit TimelineWidget(QWidget *parent = nullptr);
+ public:
+  explicit TimelineWidget(QWidget* parent = nullptr);
   QScrollBar* scrollBar;
   bool bottom_align;
 
-public slots:
+ public slots:
 
-protected:
+ protected:
   void paintEvent(QPaintEvent*) override;
 
-  void resizeEvent(QResizeEvent *event) override;
+  void resizeEvent(QResizeEvent* event) override;
 
-  void mouseDoubleClickEvent(QMouseEvent *event) override;
-  void mousePressEvent(QMouseEvent *event) override;
-  void mouseReleaseEvent(QMouseEvent *event) override;
-  void mouseMoveEvent(QMouseEvent *event) override;
-  void leaveEvent(QEvent *event) override;
+  void mouseDoubleClickEvent(QMouseEvent* event) override;
+  void mousePressEvent(QMouseEvent* event) override;
+  void mouseReleaseEvent(QMouseEvent* event) override;
+  void mouseMoveEvent(QMouseEvent* event) override;
+  void leaveEvent(QEvent* event) override;
 
-  void dragEnterEvent(QDragEnterEvent *event) override;
-  void dragLeaveEvent(QDragLeaveEvent *event) override;
+  void dragEnterEvent(QDragEnterEvent* event) override;
+  void dragLeaveEvent(QDragLeaveEvent* event) override;
   void dropEvent(QDropEvent* event) override;
-  void dragMoveEvent(QDragMoveEvent *event) override;
+  void dragMoveEvent(QDragMoveEvent* event) override;
 
-  void wheelEvent(QWheelEvent *event) override;
-private:
+  void wheelEvent(QWheelEvent* event) override;
+
+ private:
   void init_ghosts();
   void update_ghosts(const QPoint& mouse_pos, bool lock_frame);
   bool is_track_visible(int track);
@@ -90,11 +93,28 @@ private:
   void mouseMoveHoverTrimDetection(QMouseEvent* event);
   void mouseMoveHoverTransition(QMouseEvent* event);
 
+  // mouseMoveMovingInit sub-helpers
+  void mouseMoveMovingInitBuildGhosts();
+  void mouseMoveMovingInitSlideGhosts();
+  void mouseMoveMovingInitRipplePrep();
+
+  // mouseMoveHoverTrimDetection sub-helpers
+  void hoverDetectClipTrim(int i, ClipPtr c, const QPoint& pos, int mouse_frame_lower, int mouse_frame_upper,
+                           bool& cursor_contains_clip, int& closeness, bool& found);
+  void hoverCheckTrackResize(const QMouseEvent* event, bool cursor_contains_clip, int min_track, int max_track);
+
+  // mouseMoveEvent sub-helpers
+  void mouseMoveHoverDispatch(QMouseEvent* event);
+
+  // show_context_menu sub-helpers
+  void buildSelectedClipsMenu(Menu& menu, const QVector<Clip*>& selected_clips);
+
   // update_ghosts sub-handlers
   void updateGhostsSnap(int effective_tool, long& frame_diff);
   void updateGhostsValidate(int effective_tool, bool clips_are_movable, long& frame_diff);
-  void updateGhostsApply(int effective_tool, bool clips_are_movable, long frame_diff,
-                          int track_diff, long& earliest_in_point);
+  void validateGhostRipple(long& frame_diff);
+  void updateGhostsApply(int effective_tool, bool clips_are_movable, long frame_diff, int track_diff,
+                         long& earliest_in_point);
   void updateGhostsApplySelections(int effective_tool, bool clips_are_movable, long frame_diff, int track_diff);
   void updateGhostsTooltip(const QPoint& mouse_pos, long frame_diff, long earliest_in_point);
 
@@ -111,12 +131,14 @@ private:
   // mousePressEvent sub-handlers
   void mousePressCreating();
   void mousePressPointer(int hovered_clip, bool shift, bool alt, int effective_tool);
+  void mousePressDispatchTool(int effective_tool, int hovered_clip, bool shift, bool alt);
 
   // mouseReleaseEvent sub-handlers
   bool mouseReleaseCreating(ComboAction* ca, bool shift);
   bool mouseReleaseMoving(ComboAction* ca, bool alt, bool ctrl);
   bool mouseReleaseTransition(ComboAction* ca);
   bool mouseReleaseSplitting(ComboAction* ca, bool alt);
+  void mouseReleaseResetState();
 
   bool track_resizing;
   int track_target;
@@ -134,12 +156,12 @@ private:
   int scroll;
 
   SetSelectionsCommand* selection_command;
-signals:
+ signals:
 
-public slots:
+ public slots:
   void setScroll(int);
 
-private slots:
+ private slots:
   void reveal_media();
   void show_context_menu(const QPoint& pos);
   void toggle_autoscale();
@@ -148,4 +170,4 @@ private slots:
   void show_clip_properties();
 };
 
-#endif // TIMELINEWIDGET_H
+#endif  // TIMELINEWIDGET_H

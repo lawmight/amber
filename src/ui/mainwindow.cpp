@@ -38,13 +38,17 @@
 #include <QTranslator>
 
 #include "core/appcontext.h"
+#include "core/path.h"
 #include "dialogs/debugdialog.h"
 #include "dialogs/footagerelinkdialog.h"
+#include "effects/internal/srtparser.h"
+#include "effects/internal/subtitleeffect.h"
+#include "engine/clip.h"
+#include "engine/undo/undostack.h"
 #include "global/config.h"
 #include "global/debug.h"
 #include "global/global.h"
-#include "ui/styling.h"
-#include "core/path.h"
+#include "global/projectio.h"
 #include "panels/panels.h"
 #include "project/projectelements.h"
 #include "project/projectfilter.h"
@@ -52,87 +56,64 @@
 #include "project/proxygenerator.h"
 #include "rendering/audio.h"
 #include "rendering/renderfunctions.h"
-#include "engine/clip.h"
+#include "ui/appcontextimpl.h"
 #include "ui/cursors.h"
 #include "ui/focusfilter.h"
 #include "ui/icons.h"
 #include "ui/menuhelper.h"
 #include "ui/sourceiconview.h"
 #include "ui/sourcetable.h"
+#include "ui/styling.h"
 #include "ui/timelineheader.h"
-#include "ui/appcontextimpl.h"
 #include "ui/viewerwidget.h"
-#include "engine/undo/undostack.h"
-#include "effects/internal/srtparser.h"
-#include "effects/internal/subtitleeffect.h"
 
 MainWindow* amber::MainWindow;
 
-void MainWindow::setup_layout(bool reset) {
-  // load panels from file
-  if (!reset) {
-    QFile panel_config(get_config_dir().filePath("layout"));
-    if (panel_config.exists() && panel_config.open(QFile::ReadOnly)) {
-      // default to resetting unless we find layout data in the XML file
-      reset = true;
-
-      // read XML layout file
-      QXmlStreamReader stream(&panel_config);
-
-      // loop through XML for all data
-      while (!stream.atEnd()) {
-        stream.readNext();
-
-        if (stream.name() == QLatin1String("panels") && stream.isStartElement()) {
-          // element contains MainWindow layout data to restore
-          stream.readNext();
-          restoreState(QByteArray::fromBase64(stream.text().toUtf8()), 0);
-          reset = false;
-
-        } else if (stream.name() == QLatin1String("panel") && stream.isStartElement()) {
-          // element contains layout data specific to a panel, we'll find the panel and load it
-
-          // get panel name from XML attribute
-          QString panel_name;
-          const QXmlStreamAttributes& attributes = stream.attributes();
-          for (const auto& attr : attributes) {
-            if (attr.name() == QLatin1String("name")) {
-              panel_name = attr.value().toString();
-              break;
-            }
-          }
-
-          if (panel_name.isEmpty()) {
-            qWarning() << "Layout file specified data for a panel but didn't specify a name. Layout wasn't loaded.";
-          } else {
-            // loop through panels for a panel with the same name
-
-            bool found_panel = false;
-
-            for (auto panel : amber::panels) {
-              if (panel->objectName() == panel_name) {
-                // found the panel, so we can load its state
-                stream.readNext();
-                panel->LoadLayoutState(QByteArray::fromBase64(stream.text().toUtf8()));
-
-                // we found it, no more need to loop through panels
-                found_panel = true;
-
-                break;
-              }
-            }
-
-            if (!found_panel) {
-              qWarning() << "Panel specified in layout data doesn't exist. Layout wasn't loaded.";
-            }
-          }
-        }
-      }
-
-      panel_config.close();
-    } else {
-      reset = true;
+static void layout_restore_panel_element(QXmlStreamReader& stream) {
+  QString panel_name;
+  for (const auto& attr : stream.attributes()) {
+    if (attr.name() == QLatin1String("name")) {
+      panel_name = attr.value().toString();
+      break;
     }
+  }
+  if (panel_name.isEmpty()) {
+    qWarning() << "Layout file specified data for a panel but didn't specify a name. Layout wasn't loaded.";
+    return;
+  }
+  for (auto panel : amber::panels) {
+    if (panel->objectName() != panel_name) continue;
+    stream.readNext();
+    panel->LoadLayoutState(QByteArray::fromBase64(stream.text().toUtf8()));
+    return;
+  }
+  qWarning() << "Panel specified in layout data doesn't exist. Layout wasn't loaded.";
+}
+
+// Returns false if reset should remain false (layout was loaded successfully).
+static bool load_layout_from_file(QMainWindow* win) {
+  QFile panel_config(get_config_dir().filePath("layout"));
+  if (!panel_config.exists() || !panel_config.open(QFile::ReadOnly)) return true;
+
+  bool reset = true;
+  QXmlStreamReader stream(&panel_config);
+  while (!stream.atEnd()) {
+    stream.readNext();
+    if (stream.name() == QLatin1String("panels") && stream.isStartElement()) {
+      stream.readNext();
+      win->restoreState(QByteArray::fromBase64(stream.text().toUtf8()), 0);
+      reset = false;
+    } else if (stream.name() == QLatin1String("panel") && stream.isStartElement()) {
+      layout_restore_panel_element(stream);
+    }
+  }
+  panel_config.close();
+  return reset;
+}
+
+void MainWindow::setup_layout(bool reset) {
+  if (!reset) {
+    reset = load_layout_from_file(this);
   }
 
   if (reset) {
@@ -174,6 +155,88 @@ void MainWindow::setup_layout(bool reset) {
   layout()->update();
 }
 
+static int purge_old_files(const QDir& dir, const QString& pattern, qint64 cutoff_ms, bool use_last_read = false) {
+  int deleted = 0;
+  for (const auto& entry : dir.entryList(pattern.isEmpty() ? QStringList() : QStringList(pattern), QDir::Files)) {
+    QString path = dir.filePath(entry);
+    qint64 ts = use_last_read ? QFileInfo(path).lastRead().toMSecsSinceEpoch()
+                              : QFileInfo(path).lastModified().toMSecsSinceEpoch();
+    if (ts < cutoff_ms) {
+      if (QFile(path).remove()) deleted++;
+    }
+  }
+  return deleted;
+}
+
+static void load_recent_projects() {
+  QFile f(amber::Global->get_recent_project_list_file());
+  if (!f.exists() || !f.open(QFile::ReadOnly | QFile::Text)) return;
+  QTextStream text_stream(&f);
+  while (true) {
+    QString line = text_stream.readLine();
+    if (line.isNull()) break;
+    amber::project_io->recentProjects().append(line);
+  }
+  f.close();
+}
+
+static void cleanup_data_dir() {
+  QString data_dir = get_data_path();
+  if (data_dir.isEmpty()) return;
+
+  QDir dir(data_dir);
+  dir.mkpath(".");
+  if (!dir.exists()) return;
+
+  qint64 a_week_ago = QDateTime::currentMSecsSinceEpoch() - 604800000LL;
+  int n = purge_old_files(dir, "autorecovery.ove.*", a_week_ago);
+  if (n > 0)
+    qInfo() << "Deleted" << n << "autorecovery" << ((n == 1) ? "file that was" : "files that were")
+            << "older than 7 days";
+
+  QDir preview_dir(dir.filePath("previews"));
+  if (preview_dir.exists()) {
+    qint64 a_month_ago = QDateTime::currentMSecsSinceEpoch() - 2592000000LL;
+    n = purge_old_files(preview_dir, QString(), a_month_ago, true);
+    if (n > 0)
+      qInfo() << "Deleted" << n << "preview" << ((n == 1) ? "file that was" : "files that were")
+              << "last read over 30 days ago";
+  }
+
+  load_recent_projects();
+}
+
+static void load_config_if_exists() {
+  QString config_path = get_config_path();
+  if (config_path.isEmpty()) return;
+  QDir config_dir(config_path);
+  config_dir.mkpath(".");
+  QString config_fn = config_dir.filePath("config.xml");
+  if (QFileInfo::exists(config_fn)) amber::CurrentConfig.load(config_fn);
+}
+
+void MainWindow::init_window_frame() {
+  QWidget* centralWidget = new QWidget(this);
+  centralWidget->setMaximumSize(QSize(0, 0));
+  setCentralWidget(centralWidget);
+  setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
+  setDockNestingEnabled(true);
+  layout()->invalidate();
+}
+
+void MainWindow::init_panels_and_menus() {
+  alloc_panels(this);
+  amber::app_ctx = new AppContextImpl();
+  setup_menus();
+
+  QStatusBar* statusBar = new QStatusBar(this);
+  statusBar->showMessage(tr("Welcome to %1").arg(amber::AppName));
+  setStatusBar(statusBar);
+
+  amber::Global->check_for_autorecovery_file();
+  set_panels_locked(amber::CurrentConfig.locked_panels);
+}
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 
@@ -183,115 +246,23 @@ MainWindow::MainWindow(QWidget* parent)
   open_debug_file();
 
   amber::DebugDialog = new DebugDialog(this);
-
   amber::MainWindow = this;
 
-  QWidget* centralWidget = new QWidget(this);
-  centralWidget->setMaximumSize(QSize(0, 0));
-  setCentralWidget(centralWidget);
+  init_window_frame();
 
-  setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
-
-  setDockNestingEnabled(true);
-
-  layout()->invalidate();
-
-  QString data_dir = get_data_path();
-  if (!data_dir.isEmpty()) {
-    QDir dir(data_dir);
-    dir.mkpath(".");
-    if (dir.exists()) {
-      qint64 a_month_ago = QDateTime::currentMSecsSinceEpoch() - 2592000000;
-      qint64 a_week_ago = QDateTime::currentMSecsSinceEpoch() - 604800000;
-
-      // TODO put delete functions in another thread?
-
-      // delete auto-recoveries older than 7 days
-      QStringList old_autorecoveries = dir.entryList(QStringList("autorecovery.ove.*"), QDir::Files);
-      int deleted_ars = 0;
-      for (const auto& old_autorecoverie : old_autorecoveries) {
-        QString file_name = data_dir + "/" + old_autorecoverie;
-        qint64 file_time = QFileInfo(file_name).lastModified().toMSecsSinceEpoch();
-        if (file_time < a_week_ago) {
-          if (QFile(file_name).remove()) deleted_ars++;
-        }
-      }
-      if (deleted_ars > 0)
-        qInfo() << "Deleted" << deleted_ars << "autorecovery"
-                << ((deleted_ars == 1) ? "file that was" : "files that were") << "older than 7 days";
-
-      // delete previews older than 30 days
-      QDir preview_dir = QDir(dir.filePath("previews"));
-      if (preview_dir.exists()) {
-        deleted_ars = 0;
-        QStringList old_prevs = preview_dir.entryList(QDir::Files);
-        for (const auto& old_prev : old_prevs) {
-          QString file_name = preview_dir.filePath(old_prev);
-          qint64 file_time = QFileInfo(file_name).lastRead().toMSecsSinceEpoch();
-          if (file_time < a_month_ago) {
-            if (QFile(file_name).remove()) deleted_ars++;
-          }
-        }
-        if (deleted_ars > 0)
-          qInfo() << "Deleted" << deleted_ars << "preview" << ((deleted_ars == 1) ? "file that was" : "files that were")
-                  << "last read over 30 days ago";
-      }
-
-      // search for open recents list
-      QFile f(amber::Global->get_recent_project_list_file());
-      if (f.exists() && f.open(QFile::ReadOnly | QFile::Text)) {
-        QTextStream text_stream(&f);
-        while (true) {
-          QString line = text_stream.readLine();
-          if (line.isNull()) {
-            break;
-          } else {
-            recent_projects.append(line);
-          }
-        }
-        f.close();
-      }
-    }
-  }
-  QString config_path = get_config_path();
-  if (!config_path.isEmpty()) {
-    QDir config_dir(config_path);
-    config_dir.mkpath(".");
-    QString config_fn = config_dir.filePath("config.xml");
-    if (QFileInfo::exists(config_fn)) {
-      amber::CurrentConfig.load(config_fn);
-    }
-  }
+  cleanup_data_dir();
+  load_config_if_exists();
 
   Restyle();
 
   amber::icon::Initialize();
 
-  alloc_panels(this);
-  amber::app_ctx = new AppContextImpl();
+  init_panels_and_menus();
 
-  // populate menu bars
-  setup_menus();
-
-  QStatusBar* statusBar = new QStatusBar(this);
-  statusBar->showMessage(tr("Welcome to %1").arg(amber::AppName));
-  setStatusBar(statusBar);
-
-  amber::Global->check_for_autorecovery_file();
-
-  // lock panels if the config says so
-  set_panels_locked(amber::CurrentConfig.locked_panels);
-
-  // set up output audio device
   init_audio();
-
-  // start omnipotent proxy generator process
   amber::proxy_generator.start();
-
-  // load preferred language from file
   amber::Global->load_translation_from_config();
 
-  // set default strings
   Retranslate();
 }
 
@@ -302,49 +273,44 @@ MainWindow::~MainWindow() {
   close_debug_file();
 }
 
+static void kbd_save_action(QByteArray& file, QAction* a) {
+  if (a->property("default").isNull()) return;
+  QKeySequence defks(a->property("default").toString());
+  if (a->shortcut() == defks) return;
+  if (!file.isEmpty()) file.append('\n');
+  file.append(a->property("id").toString().toUtf8());
+  file.append('\t');
+  file.append(a->shortcut().toString().toUtf8());
+}
+
+static void kbd_load_action(QByteArray& file, QAction* a, bool first) {
+  if (first) {
+    a->setProperty("default", a->shortcut().toString());
+  } else {
+    a->setShortcut(a->property("default").toString());
+  }
+  if (a->property("id").isNull()) return;
+  QString comp_str = a->property("id").toString();
+  int shortcut_index = file.indexOf(comp_str.toUtf8());
+  if (shortcut_index != 0 && (shortcut_index < 0 || file.at(shortcut_index - 1) != '\n')) return;
+  shortcut_index += comp_str.size() + 1;
+  QString shortcut;
+  while (shortcut_index < file.size() && file.at(shortcut_index) != '\n') {
+    shortcut.append(file.at(shortcut_index++));
+  }
+  QKeySequence ks(shortcut);
+  if (!ks.isEmpty()) a->setShortcut(ks);
+}
+
 void kbd_shortcut_processor(QByteArray& file, QMenu* menu, bool save, bool first) {
-  QList<QAction*> actions = menu->actions();
-  for (auto a : actions) {
+  for (auto a : menu->actions()) {
     if (a->menu() != nullptr) {
       kbd_shortcut_processor(file, a->menu(), save, first);
     } else if (!a->isSeparator()) {
       if (save) {
-        // saving custom shortcuts
-        if (!a->property("default").isNull()) {
-          QKeySequence defks(a->property("default").toString());
-          if (a->shortcut() != defks) {
-            // custom shortcut
-            if (!file.isEmpty()) file.append('\n');
-            file.append(a->property("id").toString().toUtf8());
-            file.append('\t');
-            file.append(a->shortcut().toString().toUtf8());
-          }
-        }
+        kbd_save_action(file, a);
       } else {
-        // loading custom shortcuts
-        if (first) {
-          // store default shortcut
-          a->setProperty("default", a->shortcut().toString());
-        } else {
-          // restore default shortcut
-          a->setShortcut(a->property("default").toString());
-        }
-        if (!a->property("id").isNull()) {
-          QString comp_str = a->property("id").toString();
-          int shortcut_index = file.indexOf(comp_str.toUtf8());
-          if (shortcut_index == 0 || (shortcut_index > 0 && file.at(shortcut_index - 1) == '\n')) {
-            shortcut_index += comp_str.size() + 1;
-            QString shortcut;
-            while (shortcut_index < file.size() && file.at(shortcut_index) != '\n') {
-              shortcut.append(file.at(shortcut_index));
-              shortcut_index++;
-            }
-            QKeySequence ks(shortcut);
-            if (!ks.isEmpty()) {
-              a->setShortcut(ks);
-            }
-          }
-        }
+        kbd_load_action(file, a, first);
       }
     }
   }
@@ -404,7 +370,7 @@ void MainWindow::Restyle() {
       // set default palette
       QPalette palette;
 
-      if (amber::CurrentConfig.style == amber::styling::kOliveDefaultLight) {
+      if (amber::CurrentConfig.style == amber::styling::kAmberDefaultLight) {
         palette.setColor(QPalette::Window, QColor(208, 208, 208));
         palette.setColor(QPalette::WindowText, Qt::black);
         palette.setColor(QPalette::Base, QColor(240, 240, 240));
@@ -420,7 +386,7 @@ void MainWindow::Restyle() {
         palette.setColor(QPalette::Highlight, QColor(42, 130, 218));
         palette.setColor(QPalette::HighlightedText, Qt::white);
 
-        /* Olive Mid
+        /* Amber Mid
         palette.setColor(QPalette::Window, QColor(128, 128, 128));
         palette.setColor(QPalette::WindowText, Qt::black);
         palette.setColor(QPalette::Base, QColor(192, 192, 192));
@@ -487,7 +453,7 @@ void MainWindow::setup_menus() {
   QMenuBar* menuBar = new QMenuBar(this);
 
   if (amber::CurrentConfig.use_native_menu_styling) {
-    OliveGlobal::SetNativeStyling(menuBar);
+    AmberGlobal::SetNativeStyling(menuBar);
   }
 
   setMenuBar(menuBar);
@@ -520,8 +486,7 @@ void MainWindow::setup_menus() {
   import_action =
       MenuHelper::create_menu_action(file_menu, "import", panel_project, SLOT(import_dialog()), QKeySequence("Ctrl+I"));
 
-  import_subtitle_action =
-      MenuHelper::create_menu_action(file_menu, "importsubtitle", this, SLOT(import_subtitle()));
+  import_subtitle_action = MenuHelper::create_menu_action(file_menu, "importsubtitle", this, SLOT(import_subtitle()));
 
   relink_media_action = MenuHelper::create_menu_action(file_menu, "relinkmedia", this, SLOT(relink_media()));
 
@@ -529,8 +494,8 @@ void MainWindow::setup_menus() {
 
   export_action = MenuHelper::create_menu_action(file_menu, "export", amber::Global.get(), SLOT(open_export_dialog()),
                                                  QKeySequence("Ctrl+M"));
-  export_frame_action = MenuHelper::create_menu_action(file_menu, "exportframe",
-      panel_sequence_viewer->viewer_widget, SLOT(save_frame()), QKeySequence("Ctrl+Shift+E"));
+  export_frame_action = MenuHelper::create_menu_action(file_menu, "exportframe", panel_sequence_viewer->viewer_widget,
+                                                       SLOT(save_frame()), QKeySequence("Ctrl+Shift+E"));
 
   file_menu->addSeparator();
 
@@ -574,10 +539,11 @@ void MainWindow::setup_menus() {
   edit_menu->addSeparator();
 
   amber::MenuHelper.make_inout_menu(edit_menu, true);
-  delete_inout_point_ =
-      MenuHelper::create_menu_action(amber::MenuHelper.inout_submenu_, "deleteinout", panel_timeline, SLOT(delete_inout()), QKeySequence(";"));
-  ripple_delete_inout_point_ = MenuHelper::create_menu_action(amber::MenuHelper.inout_submenu_, "rippledeleteinout", panel_timeline,
-                                                              SLOT(ripple_delete_inout()), QKeySequence("'"));
+  delete_inout_point_ = MenuHelper::create_menu_action(amber::MenuHelper.inout_submenu_, "deleteinout", panel_timeline,
+                                                       SLOT(delete_inout()), QKeySequence(";"));
+  ripple_delete_inout_point_ =
+      MenuHelper::create_menu_action(amber::MenuHelper.inout_submenu_, "rippledeleteinout", panel_timeline,
+                                     SLOT(ripple_delete_inout()), QKeySequence("'"));
 
   edit_menu->addSeparator();
 
@@ -650,20 +616,20 @@ void MainWindow::setup_menus() {
   preview_resolution_menu = MenuHelper::create_submenu(view_menu);
   QActionGroup* preview_res_group = new QActionGroup(this);
 
-  preview_res_full_ = MenuHelper::create_menu_action(preview_resolution_menu, "previewfull",
-      this, SLOT(set_preview_resolution()));
+  preview_res_full_ =
+      MenuHelper::create_menu_action(preview_resolution_menu, "previewfull", this, SLOT(set_preview_resolution()));
   preview_res_full_->setData(1);
   preview_res_full_->setCheckable(true);
   preview_res_group->addAction(preview_res_full_);
 
-  preview_res_half_ = MenuHelper::create_menu_action(preview_resolution_menu, "previewhalf",
-      this, SLOT(set_preview_resolution()));
+  preview_res_half_ =
+      MenuHelper::create_menu_action(preview_resolution_menu, "previewhalf", this, SLOT(set_preview_resolution()));
   preview_res_half_->setData(2);
   preview_res_half_->setCheckable(true);
   preview_res_group->addAction(preview_res_half_);
 
-  preview_res_quarter_ = MenuHelper::create_menu_action(preview_resolution_menu, "previewquarter",
-      this, SLOT(set_preview_resolution()));
+  preview_res_quarter_ =
+      MenuHelper::create_menu_action(preview_resolution_menu, "previewquarter", this, SLOT(set_preview_resolution()));
   preview_res_quarter_->setData(4);
   preview_res_quarter_->setCheckable(true);
   preview_res_group->addAction(preview_res_quarter_);
@@ -717,7 +683,7 @@ void MainWindow::setup_menus() {
 
   guides_menu_ = MenuHelper::create_submenu(view_menu);
   lock_guides_ = MenuHelper::create_menu_action(guides_menu_, "lockguides", &amber::MenuHelper,
-                                                 SLOT(toggle_bool_action()), QKeySequence("Ctrl+Alt+;"));
+                                                SLOT(toggle_bool_action()), QKeySequence("Ctrl+Alt+;"));
   lock_guides_->setCheckable(true);
   lock_guides_->setData(reinterpret_cast<quintptr>(&amber::CurrentConfig.lock_guides));
   guides_menu_->addSeparator();
@@ -907,8 +873,7 @@ void MainWindow::setup_menus() {
   snap_toggle->setCheckable(true);
   snap_toggle->setData(reinterpret_cast<quintptr>(panel_timeline->snappingButton));
 
-  color_labels_toggle =
-      MenuHelper::create_menu_action(tools_menu, "colorlabels", this, SLOT(toggle_color_labels()));
+  color_labels_toggle = MenuHelper::create_menu_action(tools_menu, "colorlabels", this, SLOT(toggle_color_labels()));
   color_labels_toggle->setCheckable(true);
 
   tools_menu->addSeparator();
@@ -1128,10 +1093,11 @@ void MainWindow::closeEvent(QCloseEvent* e) {
 
     QString data_dir = get_data_path();
     QString config_path = get_config_path();
-    if (!data_dir.isEmpty() && !autorecovery_filename.isEmpty()) {
-      if (QFile::exists(autorecovery_filename)) {
-        QFile::rename(autorecovery_filename,
-                      autorecovery_filename + "." + QDateTime::currentDateTimeUtc().toString("yyyyMMddHHmmss"));
+    if (!data_dir.isEmpty() && !amber::project_io->autorecoveryFilename().isEmpty()) {
+      if (QFile::exists(amber::project_io->autorecoveryFilename())) {
+        QFile::rename(amber::project_io->autorecoveryFilename(),
+                      amber::project_io->autorecoveryFilename() + "." +
+                          QDateTime::currentDateTimeUtc().toString("yyyyMMddHHmmss"));
       }
     }
     if (!config_path.isEmpty()) {
@@ -1374,30 +1340,26 @@ void MainWindow::relink_media() {
 
 void MainWindow::import_subtitle() {
   if (amber::ActiveSequence == nullptr) {
-    QMessageBox::warning(this, tr("No Sequence"),
-                         tr("Please open a sequence before importing subtitles."));
+    QMessageBox::warning(this, tr("No Sequence"), tr("Please open a sequence before importing subtitles."));
     return;
   }
 
-  QString filepath = QFileDialog::getOpenFileName(
-      this, tr("Import Subtitle"), QString(),
-      tr("SRT Subtitle Files (*.srt);;All Files (*)"));
+  QString filepath = QFileDialog::getOpenFileName(this, tr("Import Subtitle"), QString(),
+                                                  tr("SRT Subtitle Files (*.srt);;All Files (*)"));
 
   if (filepath.isEmpty()) return;
 
   SrtParseResult result = parse_srt(filepath);
 
   if (result.cues.isEmpty()) {
-    QMessageBox::warning(this, tr("Import Failed"),
-                         tr("No valid subtitle cues found in the file."));
+    QMessageBox::warning(this, tr("Import Failed"), tr("No valid subtitle cues found in the file."));
     return;
   }
 
   if (result.skipped > 0) {
-    QMessageBox::information(this, tr("Import Subtitle"),
-                             tr("Imported %1 cues, %2 skipped (malformed).")
-                                 .arg(result.cues.size())
-                                 .arg(result.skipped));
+    QMessageBox::information(
+        this, tr("Import Subtitle"),
+        tr("Imported %1 cues, %2 skipped (malformed).").arg(result.cues.size()).arg(result.skipped));
   }
 
   Sequence* seq = amber::ActiveSequence.get();
@@ -1438,13 +1400,13 @@ void MainWindow::import_subtitle() {
 
   // Add Transform effect (standard for video clips)
   if (amber::CurrentConfig.add_default_effects_to_clips) {
-    clip->effects.append(Effect::Create(
-        clip.get(), Effect::GetInternalMeta(EFFECT_INTERNAL_TRANSFORM, EFFECT_TYPE_EFFECT)));
+    clip->effects.append(
+        Effect::Create(clip.get(), Effect::GetInternalMeta(EFFECT_INTERNAL_TRANSFORM, EFFECT_TYPE_EFFECT)));
   }
 
   // Add SubtitleEffect with parsed cues
-  EffectPtr sub_effect = Effect::Create(
-      clip.get(), Effect::GetInternalMeta(EFFECT_INTERNAL_SUBTITLE, EFFECT_TYPE_EFFECT));
+  EffectPtr sub_effect =
+      Effect::Create(clip.get(), Effect::GetInternalMeta(EFFECT_INTERNAL_SUBTITLE, EFFECT_TYPE_EFFECT));
   static_cast<SubtitleEffect*>(sub_effect.get())->SetCues(result.cues);
   clip->effects.append(sub_effect);
 
@@ -1492,11 +1454,11 @@ void MainWindow::set_panels_locked(bool locked) {
 }
 
 void MainWindow::fileMenu_About_To_Be_Shown() {
-  if (recent_projects.size() > 0) {
+  if (amber::project_io->recentProjects().size() > 0) {
     open_recent->clear();
     open_recent->setEnabled(true);
-    for (int i = 0; i < recent_projects.size(); i++) {
-      QAction* action = open_recent->addAction(recent_projects.at(i));
+    for (int i = 0; i < amber::project_io->recentProjects().size(); i++) {
+      QAction* action = open_recent->addAction(amber::project_io->recentProjects().at(i));
       action->setProperty("keyignore", true);
       action->setData(i);
       connect(action, &QAction::triggered, &amber::MenuHelper, &MenuHelper::open_recent_from_menu);

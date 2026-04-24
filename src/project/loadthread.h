@@ -21,41 +21,50 @@
 #ifndef LOADTHREAD_H
 #define LOADTHREAD_H
 
-#include <QThread>
 #include <QDir>
-#include <QPair>
-#include <QXmlStreamReader>
-#include <QMutex>
-#include <QWaitCondition>
 #include <QMessageBox>
+#include <QMutex>
+#include <QPair>
+#include <QThread>
+#include <QWaitCondition>
+#include <QXmlStreamReader>
 
-#include "project/projectelements.h"
-#include "engine/clip.h"
 #include "core/guide.h"
+#include "engine/clip.h"
+#include "project/projectelements.h"
 
-class LoadThread : public QThread
-{
+class LoadThread : public QThread {
   Q_OBJECT
-public:
+ public:
   LoadThread(const QString& filename, bool autorecovery);
   void run() override;
-public slots:
+ public slots:
   void cancel();
-signals:
-  void start_question(const QString &title, const QString &text, int buttons);
+ signals:
+  void start_question(const QString& title, const QString& text, int buttons);
   void success();
   void error();
   void report_progress(int p);
   void found_invalid_footage(QVector<QPair<Media*, Footage*>> invalid);
-private slots:
-  void question_func(const QString &title, const QString &text, int buttons);
+ private slots:
+  void question_func(const QString& title, const QString& text, int buttons);
   void error_func();
   void success_func();
-private:
+
+ private:
   bool autorecovery_;
   QString filename_;
 
   bool load_worker(QFile& f, QXmlStreamReader& stream, int type);
+  bool load_worker_traverse_collection(QXmlStreamReader& stream, int type, const QString& root_search,
+                                       const QString& child_search);
+  bool handle_scalar_load_type(QXmlStreamReader& stream, int type);
+  bool parse_collection_child(QXmlStreamReader& stream, int type, const QString& child_search);
+  void link_nested_sequence_clips();
+  void finalize_loaded_media();
+  int count_elements(QXmlStreamReader& stream);
+  bool load_all_phases(QFile& file, QXmlStreamReader& stream);
+  bool handle_load_result(QXmlStreamReader& stream, bool cont);
   void load_effect(QXmlStreamReader& stream, Clip* c);
 
   // Per-element parse helpers (called from load_worker)
@@ -63,12 +72,14 @@ private:
   void parse_footage(QXmlStreamReader& stream, const QStringView& child_search);
   bool parse_sequence(QXmlStreamReader& stream, const QStringView& child_search);
   bool parse_clip(QXmlStreamReader& stream, SequencePtr s);
+  bool parse_clip_child_element(QXmlStreamReader& stream, ClipPtr c);
   Marker parse_marker(QXmlStreamReader& stream);
   Guide parse_guide(QXmlStreamReader& stream);
   QString resolve_footage_url(const QString& raw_url);
   void parse_clip_links(QXmlStreamReader& stream, Clip* c);
   void parse_clip_attributes(QXmlStreamReader& stream, ClipPtr c, int& media_type, int& media_id, int& stream_id);
   void parse_sequence_attributes(QXmlStreamReader& stream, SequencePtr s, Media*& parent);
+  void apply_sequence_attr(const QXmlStreamAttribute& attr, SequencePtr s, Media*& parent);
   bool correct_clip_links(SequencePtr s);
 
   void read_next(QXmlStreamReader& stream);
@@ -106,4 +117,4 @@ private:
   QMessageBox::StandardButton question_btn;
 };
 
-#endif // LOADTHREAD_H
+#endif  // LOADTHREAD_H

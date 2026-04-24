@@ -60,7 +60,7 @@ namespace amber {
     /**
      * @brief Set default track sizes
      *
-     * Olive has a few default constants used for adjusting track heights in the Timeline. For HiDPI, it makes
+     * Amber has a few default constants used for adjusting track heights in the Timeline. For HiDPI, it makes
      * sense to multiply these by the current DPI scale. It uses a variable from QApplication to do this multiplication,
      * which means the QApplication instance needs to be instantiated before these are calculated. Therefore, call this
      * function ONCE after QApplication is created to multiply the track heights correctly.
@@ -138,6 +138,8 @@ public:
 
   int get_snap_range();
   bool snap_to_point(long point, long* l);
+  bool toolSupportsInsert() const;
+  bool snap_to_markers(long* l);
   bool snap_to_timeline(long* l, bool use_playhead, bool use_markers, bool use_workarea, bool for_playhead = false);
   void set_marker();
 

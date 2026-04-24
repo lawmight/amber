@@ -51,6 +51,7 @@ class AudioSenderThread : public QThread {
   int scrub_grain_total_{0};
   int scrub_grain_played_{0};
   QByteArray staging_buffer_;
+  QVector<double> vu_averages_;
 };
 
 extern QAudioSink* audio_output;
@@ -72,7 +73,7 @@ void init_audio();
 void stop_audio();
 qint64 get_buffer_offset_from_frame(double framerate, long frame);
 
-bool start_recording();
+bool start_recording(const QString& project_filename);
 void stop_recording();
 QString get_recorded_audio_filename();
 

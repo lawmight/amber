@@ -21,8 +21,6 @@
 #include "audio.h"
 
 #include "core/appcontext.h"
-#include "global/global.h"
-
 #include "engine/sequence.h"
 
 #include "global/config.h"
@@ -276,21 +274,20 @@ int AudioSenderThread::send_audio_to_output(qint64 offset, int max) {
   if (consumed > 0) {
     int channels = audio_output->format().channelCount();
     qint64 lim = offset + consumed;
-    QVector<double> averages;
-    averages.resize(channels);
-    averages.fill(0);
+    if (vu_averages_.size() != channels) vu_averages_.resize(channels);
+    vu_averages_.fill(0);
 
     int counter = 0;
     qint16 sample;
     for (qint64 i = offset; i < lim; i += 2) {
       sample = qint16(((audio_ibuffer[i + 1] & 0xFF) << 8) | (audio_ibuffer[i] & 0xFF));
-      averages[counter] = qMax((double(qAbs(sample)) / 32768.0), averages[counter]);
+      vu_averages_[counter] = qMax((double(qAbs(sample)) / 32768.0), vu_averages_[counter]);
       counter = (counter + 1) % channels;
     }
     for (int i = 0; i < channels; i++) {
-      averages[i] = log_volume(1.0 - (averages[i]));
+      vu_averages_[i] = log_volume(1.0 - (vu_averages_[i]));
     }
-    amber::app_ctx->setAudioMonitorValues(averages);
+    amber::app_ctx->setAudioMonitorValues(vu_averages_);
   }
 
   memset(audio_ibuffer + offset, 0, consumed);
@@ -376,13 +373,8 @@ void write_wave_trailer(QFile& f) {
   f.write(arr, 4);
 }
 
-bool start_recording() {
-  if (amber::ActiveSequence == nullptr) {
-    qCritical() << "No active sequence to record into";
-    return false;
-  }
-
-  QString audio_path = QCoreApplication::translate("Audio", "%1 Audio").arg(amber::ActiveProjectFilename);
+bool start_recording(const QString& project_filename) {
+  QString audio_path = QCoreApplication::translate("Audio", "%1 Audio").arg(project_filename);
   QDir audio_dir(audio_path);
   if (!audio_dir.exists() && !audio_dir.mkpath(".")) {
     qCritical() << "Failed to create audio directory";
@@ -402,7 +394,7 @@ bool start_recording() {
 
   output_recording.setFileName(audio_file_path);
   if (!output_recording.open(QFile::WriteOnly)) {
-    qCritical() << "Failed to open output file. Does Olive have permission to write to this directory?";
+    qCritical() << "Failed to open output file. Does Amber have permission to write to this directory?";
     return false;
   }
 

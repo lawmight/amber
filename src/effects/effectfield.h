@@ -21,6 +21,7 @@
 #ifndef EFFECTFIELD_H
 #define EFFECTFIELD_H
 
+#include <QColor>
 #include <QObject>
 #include <QVariant>
 #include <QVector>
@@ -43,23 +44,18 @@ class ComboAction;
  * is abstract, and therefore never intended to be used on its own. Instead you should always use a derived class.
  *
  * EffectField objects are *not* UI objects on their own. Instead, they're largely a system of values that can change
- * over time. For a widget that the user can use to edit/modify these values, use CreateWidget().
+ * over time. For a widget that the user can use to edit/modify these values, use EffectFieldWidget::Create().
  *
- * Derived classes are expected to override at least CreateWidget() to create a visual interactive widget corresponding
- * to the field. If this
- * field is a value used in the Effect (as most will be), UpdateWidgetValue() should also be overridden to display the
- * correct value for this field as the user moves around the Timeline.
- *
- * If the field is intended to be saved and loaded from Olive project files (as most will be), ConvertStringToValue()
+ * If the field is intended to be saved and loaded from Amber project files (as most will be), ConvertStringToValue()
  * and ConvertValueToString() may also have to be overridden depending on how the derived class's data works.
  */
 class EffectField : public QObject {
   Q_OBJECT
-public:
+ public:
   /**
    * @brief The EffectFieldType enum
    *
-   * Predetermined types of fields. Used throughout Olive to identify what kind of data to expect from GetValueAt().
+   * Predetermined types of fields. Used throughout Amber to identify what kind of data to expect from GetValueAt().
    *
    * This enum is also currently used to match an external XML effect's fields with the correct derived class (e.g.
    * EFFECT_FIELD_DOUBLE matches to DoubleField).
@@ -147,7 +143,7 @@ public:
    * @brief Get the value of this field at a given timecode
    *
    * EffectFields are designed to be keyframable, meaning the user can make the values change over the course of the
-   * Sequence. This is the main function used through Olive to retrieve what value this field will be at a given time.
+   * Sequence. This is the main function used through Amber to retrieve what value this field will be at a given time.
    *
    * A common use case for this function would be EffectField::GetValueAt(EffectField::Now()), which will automatically
    * retrieve the timecode at the current playhead.
@@ -172,7 +168,7 @@ public:
    * @brief Set the value of this field at a given timecode
    *
    * EffectFields are designed to be keyframable, meaning the user can make the values change over the course of the
-   * Sequence. This is the main function used through Olive to set what value this field will be at a given time.
+   * Sequence. This is the main function used through Amber to set what value this field will be at a given time.
    *
    * If the parent EffectRow is keyframing, this function will determine whether a keyframe exists at this time already.
    * If it does, it will change the value at that keyframe to `value`. Otherwise, it'll create a new keyframe at the
@@ -301,58 +297,6 @@ public:
    */
   virtual QVariant ConvertStringToValue(const QString& s);
 
-
-  /**
-   * @brief Create a widget for the user to interact with this field
-   *
-   * EffectField objects are *not* UI objects on their own. Instead, they're largely a system of values that can change
-   * over time. This function creates a QWidget object that can be placed somewhere in the UI so the user can
-   * interact with and change the data in this field.
-   *
-   * This function must be overridden by derived classes in order to create a widget that appropriate for that field's
-   * data. The derived class is also responsible for
-   * connecting signals like EnabledChanged(), Clicked(), and any other data that needs to be transferred between the
-   * widget and the field (setting up the signals and slots to do so). The field does NOT retain ownership (or any
-   * reference for that matter) to widgets it creates,
-   * so keeping the widget and field up to date with each other relies solely on setting up signals and slots.
-   * Infinite widgets can be created from a single field and used throughout Olive this way.
-   *
-   * Ownership is passed to the caller, and therefore the caller is responsible for freeing it.
-   *
-   * @param existing
-   *
-   * Olive allows multiple effects to attach to one UI layout. Pass a QWidget to this parameter (instead of nullptr)
-   * to attach this field additionally to the widget's signals/slots without creating a new one. The QWidget must be a
-   * widget previously created from the same derived class type or the result is undefined.
-   *
-   * @return
-   *
-   * A new QWidget object for this EffectField, or the same QWidget passed to `existing` if one was specified.
-   */
-  virtual QWidget* CreateWidget(QWidget* existing = nullptr) = 0;
-
-  /**
-   * @brief Update a widget created by CreateWidget() using the value at a given time
-   *
-   * Use this function to update a QWidget (obtained from CreateWidget()) with the correct value from the field at a
-   * given time.
-   *
-   * Since only the derived classes know what type of QWidget it created in CreateWidget() and how to work with them,
-   * derived classes are also expected to override this function if the field is an active value used in the Effect
-   * that should visually update as the user moves around the Timeline. However if the field does NOT need to update
-   * live (e.g. the field is just a UI wrapper like LabelField or ButtonField), this function does not need to be
-   * overridden as the default behavior (to do nothing) will suffice in those cases.
-   *
-   * @param widget
-   *
-   * The QWidget to set the value of (must be a QWidget obtained from CreateWidget() or the behavior is undefined).
-   *
-   * @param timecode
-   *
-   * The time in clip/media seconds to retrieve data from.
-   */
-  virtual void UpdateWidgetValue(QWidget* widget, double timecode);
-
   /**
    * @brief Get the correct X position/time value of a bezier keyframe's handles
    *
@@ -416,7 +360,7 @@ public:
    */
   QVector<EffectKeyframe> keyframes;
 
-signals:
+ signals:
   /**
    * @brief Changed signal
    *
@@ -428,20 +372,18 @@ signals:
   /**
    * @brief Clicked signal
    *
-   * Emitted when the user clicks on a QWidget attached to this field. Derived classes should connect this to the
-   * clicked signal of any QWidget's created (or attached) in CreateWidget().
+   * Emitted when the user clicks on a QWidget attached to this field.
    */
   void Clicked();
 
   /**
    * @brief Enable change state signal
    *
-   * Emitted when the field's enabled state is changed through SetEnabled(). Derived classes should connect this to the
-   * setEnabled() slot of any QWidget's created (or attached) in CreateWidget().
+   * Emitted when the field's enabled state is changed through SetEnabled().
    */
   void EnabledChanged(bool);
 
-private:
+ private:
   /**
    * @brief Internal type variable set in the constructor. Access with type().
    */
@@ -508,6 +450,22 @@ private:
   void GetKeyframeData(double timecode, int& before, int& after, double& d);
 
   /**
+   * @brief Interpolate a DOUBLE field between two keyframes.
+   */
+  double InterpolateDouble(double timecode, int before_keyframe, int after_keyframe, double progress);
+
+  /**
+   * @brief Interpolate a COLOR field between two keyframes.
+   */
+  QColor InterpolateColor(int before_keyframe, int after_keyframe, double progress);
+
+  /**
+   * @brief Find the nearest adjacent keyframe (next if post=true, previous if post=false).
+   * Returns -1 if none exists.
+   */
+  int FindAdjacentKeyframe(int key, bool post) const;
+
+  /**
    * @brief Retrieve the current clip as a frame number
    *
    * Same as Now() but retrieves the value as a frame number (in the appropriate Sequence's frame rate) instead of
@@ -538,7 +496,6 @@ private:
    * @brief Whether default_data_ has been explicitly set
    */
   bool has_default_{false};
-
 };
 
-#endif // EFFECTFIELD_H
+#endif  // EFFECTFIELD_H

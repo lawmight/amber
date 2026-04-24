@@ -20,41 +20,31 @@
 
 #include "effect.h"
 
+#include <rhi/qshaderbaker.h>
 #include <QApplication>
 #include <QCheckBox>
 #include <QCryptographicHash>
 #include <QDir>
-#include <QFileDialog>
 #include <QGridLayout>
 #include <QMenu>
-#include <QMessageBox>
 #include <QPainter>
 #include <QStandardPaths>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 #include <QtMath>
-#include <rhi/qshaderbaker.h>
 
-#include "global/config.h"
-#include "global/debug.h"
+#include "core/appcontext.h"
 #include "core/math.h"
 #include "core/path.h"
-#include "panels/effectcontrols.h"
-#include "panels/grapheditor.h"
-#include "panels/panels.h"
-#include "panels/project.h"
-#include "panels/timeline.h"
-#include "panels/viewer.h"
-#include "project/clipboard.h"
 #include "engine/clip.h"
 #include "engine/sequence.h"
-#include "transition.h"
-#include "ui/collapsiblewidget.h"
-#include "ui/mainwindow.h"
-#include "ui/viewerwidget.h"
 #include "engine/undo/undo.h"
 #include "engine/undo/undostack.h"
+#include "global/config.h"
+#include "global/debug.h"
+#include "project/clipboard.h"
 #include "rendering/renderthread.h"
+#include "transition.h"
 
 #include "effects/internal/audionoiseeffect.h"
 #include "effects/internal/cornerpineffect.h"
@@ -94,56 +84,201 @@ int FieldTypeFromString(const QString& type_str) {
   return -1;
 }
 
+// Find the field index in `row` matching the "id" attribute in `stream`.
+// Returns -1 if not found.
+int FindFieldByStreamId(QXmlStreamReader& stream, EffectRow* row) {
+  for (const auto& attr : stream.attributes()) {
+    if (attr.name() == QLatin1String("id")) {
+      for (int l = 0; l < row->FieldCount(); l++) {
+        if (row->Field(l)->id() == attr.value()) return l;
+      }
+      break;
+    }
+  }
+  return -1;
+}
+
+// Apply the "value" attribute from `stream` to `field`'s persistent data.
+void ApplyFieldValue(QXmlStreamReader& stream, EffectField* field) {
+  for (const auto& attr : stream.attributes()) {
+    if (attr.name() == QLatin1String("value")) {
+      field->persistent_data_ = field->ConvertStringToValue(attr.value().toString());
+      break;
+    }
+  }
+}
+
+// Parse a single <key> element from `stream` into an EffectKeyframe.
+EffectKeyframe ParseKeyframe(QXmlStreamReader& stream, EffectField* field) {
+  EffectKeyframe key;
+  for (const auto& attr : stream.attributes()) {
+    if (attr.name() == QLatin1String("value")) {
+      key.data = field->ConvertStringToValue(attr.value().toString());
+    } else if (attr.name() == QLatin1String("frame")) {
+      key.time = attr.value().toLong();
+    } else if (attr.name() == QLatin1String("type")) {
+      key.type = attr.value().toInt();
+    } else if (attr.name() == QLatin1String("prehx")) {
+      key.pre_handle_x = attr.value().toDouble();
+    } else if (attr.name() == QLatin1String("prehy")) {
+      key.pre_handle_y = attr.value().toDouble();
+    } else if (attr.name() == QLatin1String("posthx")) {
+      key.post_handle_x = attr.value().toDouble();
+    } else if (attr.name() == QLatin1String("posthy")) {
+      key.post_handle_y = attr.value().toDouble();
+    }
+  }
+  return key;
+}
+
+// Load a single <field> element (including nested <key> children) from `stream`.
+void LoadFieldElement(QXmlStreamReader& stream, EffectRow* row) {
+  int field_number = FindFieldByStreamId(stream, row);
+  if (field_number < 0) return;
+
+  EffectField* field = row->Field(field_number);
+  ApplyFieldValue(stream, field);
+
+  while (!stream.atEnd() && !(stream.name() == QLatin1String("field") && stream.isEndElement())) {
+    stream.readNext();
+    if (stream.name() == QLatin1String("key") && stream.isStartElement()) {
+      row->SetKeyframingInternal(true);
+      field->keyframes.append(ParseKeyframe(stream, field));
+    }
+  }
+
+  field->Changed();
+}
+
+// Load a single <row> element (including nested <field> children) from `stream`.
+void LoadRowElement(QXmlStreamReader& stream, EffectRow* row) {
+  while (!stream.atEnd() && !(stream.name() == QLatin1String("row") && stream.isEndElement())) {
+    stream.readNext();
+    if (stream.name() == QLatin1String("field") && stream.isStartElement()) {
+      LoadFieldElement(stream, row);
+    }
+  }
+}
+
+// Write a single field UBO value for `process_shader`.
+void WriteFieldUboValue(EffectField* field, double timecode, const UniformEntry& entry, QByteArray& uboData) {
+  switch (field->type()) {
+    case EffectField::EFFECT_FIELD_DOUBLE: {
+      float v = float(static_cast<DoubleField*>(field)->GetDoubleAt(timecode));
+      memcpy(uboData.data() + entry.offset, &v, 4);
+    } break;
+    case EffectField::EFFECT_FIELD_COLOR: {
+      ColorField* cf = static_cast<ColorField*>(field);
+      QColor c = cf->GetColorAt(timecode);
+      float rgb[3] = {float(c.redF()), float(c.greenF()), float(c.blueF())};
+      memcpy(uboData.data() + entry.offset, rgb, qMin(entry.size, 12));
+    } break;
+    case EffectField::EFFECT_FIELD_BOOL: {
+      int v = field->GetValueAt(timecode).toBool() ? 1 : 0;
+      memcpy(uboData.data() + entry.offset, &v, 4);
+    } break;
+    case EffectField::EFFECT_FIELD_COMBO: {
+      int v = field->GetValueAt(timecode).toInt();
+      memcpy(uboData.data() + entry.offset, &v, 4);
+    } break;
+    default:
+      break;
+  }
+}
+
+// Write built-in automatic uniforms (resolution, time, iteration) into uboData.
+void WriteAutoUniforms(const QVector<UniformEntry>& entries, double timecode, int iteration, float resW, float resH,
+                       QByteArray& uboData) {
+  for (const auto& entry : entries) {
+    if (entry.name == QLatin1String("resolution")) {
+      float res[2] = {resW, resH};
+      memcpy(uboData.data() + entry.offset, res, qMin(entry.size, 8));
+    } else if (entry.name == QLatin1String("resolution_x")) {
+      memcpy(uboData.data() + entry.offset, &resW, 4);
+    } else if (entry.name == QLatin1String("resolution_y")) {
+      memcpy(uboData.data() + entry.offset, &resH, 4);
+    } else if (entry.name == QLatin1String("time")) {
+      float v = float(timecode);
+      memcpy(uboData.data() + entry.offset, &v, 4);
+    } else if (entry.name == QLatin1String("iteration")) {
+      int v = iteration;
+      memcpy(uboData.data() + entry.offset, &v, 4);
+    }
+  }
+}
+
+// Write all field-driven uniforms into uboData by matching field IDs to uniform names.
+void WriteFieldUniforms(Effect* effect, const QVector<UniformEntry>& entries, double timecode, QByteArray& uboData) {
+  for (int r = 0; r < effect->row_count(); r++) {
+    EffectRow* erow = effect->row(r);
+    for (int j = 0; j < erow->FieldCount(); j++) {
+      EffectField* field = erow->Field(j);
+      if (field->id().isEmpty()) continue;
+      for (const auto& entry : entries) {
+        if (entry.name == field->id()) {
+          WriteFieldUboValue(field, timecode, entry, uboData);
+          break;
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
+
+static EffectPtr CreateInternalEffect(Clip* c, const EffectMeta* em) {
+  switch (em->internal) {
+    case EFFECT_INTERNAL_TRANSFORM:
+      return std::make_shared<TransformEffect>(c, em);
+    case EFFECT_INTERNAL_TEXT:
+      return std::make_shared<TextEffect>(c, em);
+    case EFFECT_INTERNAL_TIMECODE:
+      return std::make_shared<TimecodeEffect>(c, em);
+    case EFFECT_INTERNAL_SOLID:
+      return std::make_shared<SolidEffect>(c, em);
+    case EFFECT_INTERNAL_NOISE:
+      return std::make_shared<AudioNoiseEffect>(c, em);
+    case EFFECT_INTERNAL_VOLUME:
+      return std::make_shared<VolumeEffect>(c, em);
+    case EFFECT_INTERNAL_PAN:
+      return std::make_shared<PanEffect>(c, em);
+    case EFFECT_INTERNAL_TONE:
+      return std::make_shared<ToneEffect>(c, em);
+    case EFFECT_INTERNAL_SHAKE:
+      return std::make_shared<ShakeEffect>(c, em);
+    case EFFECT_INTERNAL_CORNERPIN:
+      return std::make_shared<CornerPinEffect>(c, em);
+    case EFFECT_INTERNAL_FILLLEFTRIGHT:
+      return std::make_shared<FillLeftRightEffect>(c, em);
+    case EFFECT_INTERNAL_VST:
+      return std::make_shared<VSTHost>(c, em);
+#ifndef NOFREI0R
+    case EFFECT_INTERNAL_FREI0R:
+      return std::make_shared<Frei0rEffect>(c, em);
+#endif
+    case EFFECT_INTERNAL_RICHTEXT:
+      return std::make_shared<RichTextEffect>(c, em);
+    case EFFECT_INTERNAL_SUBTITLE:
+      return std::make_shared<SubtitleEffect>(c, em);
+    default:
+      return nullptr;
+  }
+}
 
 EffectPtr Effect::Create(Clip* c, const EffectMeta* em) {
   if (em->internal >= 0 && em->internal < EFFECT_INTERNAL_COUNT) {
-    // must be an internal effect
-    switch (em->internal) {
-      case EFFECT_INTERNAL_TRANSFORM:
-        return std::make_shared<TransformEffect>(c, em);
-      case EFFECT_INTERNAL_TEXT:
-        return std::make_shared<TextEffect>(c, em);
-      case EFFECT_INTERNAL_TIMECODE:
-        return std::make_shared<TimecodeEffect>(c, em);
-      case EFFECT_INTERNAL_SOLID:
-        return std::make_shared<SolidEffect>(c, em);
-      case EFFECT_INTERNAL_NOISE:
-        return std::make_shared<AudioNoiseEffect>(c, em);
-      case EFFECT_INTERNAL_VOLUME:
-        return std::make_shared<VolumeEffect>(c, em);
-      case EFFECT_INTERNAL_PAN:
-        return std::make_shared<PanEffect>(c, em);
-      case EFFECT_INTERNAL_TONE:
-        return std::make_shared<ToneEffect>(c, em);
-      case EFFECT_INTERNAL_SHAKE:
-        return std::make_shared<ShakeEffect>(c, em);
-      case EFFECT_INTERNAL_CORNERPIN:
-        return std::make_shared<CornerPinEffect>(c, em);
-      case EFFECT_INTERNAL_FILLLEFTRIGHT:
-        return std::make_shared<FillLeftRightEffect>(c, em);
-      case EFFECT_INTERNAL_VST:
-        return std::make_shared<VSTHost>(c, em);
-#ifndef NOFREI0R
-      case EFFECT_INTERNAL_FREI0R:
-        return std::make_shared<Frei0rEffect>(c, em);
-#endif
-      case EFFECT_INTERNAL_RICHTEXT:
-        return std::make_shared<RichTextEffect>(c, em);
-      case EFFECT_INTERNAL_SUBTITLE:
-        return std::make_shared<SubtitleEffect>(c, em);
-    }
-  } else if (!em->filename.isEmpty()) {
-    // load effect from file
-    return std::make_shared<Effect>(c, em);
-  } else {
-    qCritical() << "Invalid effect data";
-    QMessageBox::critical(
-        amber::MainWindow, QCoreApplication::translate("Effect", "Invalid effect"),
-        QCoreApplication::translate(
-            "Effect", "No candidate for effect '%1'. This effect may be corrupt. Try reinstalling it or Amber.")
-            .arg(em->name));
+    return CreateInternalEffect(c, em);
   }
+  if (!em->filename.isEmpty()) {
+    return std::make_shared<Effect>(c, em);
+  }
+  qCritical() << "Invalid effect data";
+  amber::app_ctx->showMessage(
+      QCoreApplication::translate("Effect", "Invalid effect"),
+      QCoreApplication::translate(
+          "Effect", "No candidate for effect '%1'. This effect may be corrupt. Try reinstalling it or Amber.")
+          .arg(em->name),
+      3);
   return nullptr;
 }
 
@@ -170,6 +305,95 @@ Effect::Effect(Clip* c, const EffectMeta* em)
   }
 }
 
+static EffectField* ParseDoubleField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs) {
+  DoubleField* f = new DoubleField(row, id);
+  for (const auto& attr : attrs) {
+    if (attr.name() == QLatin1String("default")) {
+      f->SetDefault(attr.value().toDouble());
+    } else if (attr.name() == QLatin1String("min")) {
+      f->SetMinimum(attr.value().toDouble());
+    } else if (attr.name() == QLatin1String("max")) {
+      f->SetMaximum(attr.value().toDouble());
+    }
+  }
+  return f;
+}
+
+static EffectField* ParseColorField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs) {
+  QColor color;
+  EffectField* f = new ColorField(row, id);
+  for (const auto& attr : attrs) {
+    if (attr.name() == QLatin1String("r")) {
+      color.setRed(attr.value().toInt());
+    } else if (attr.name() == QLatin1String("g")) {
+      color.setGreen(attr.value().toInt());
+    } else if (attr.name() == QLatin1String("b")) {
+      color.setBlue(attr.value().toInt());
+    } else if (attr.name() == QLatin1String("rf")) {
+      color.setRedF(attr.value().toDouble());
+    } else if (attr.name() == QLatin1String("gf")) {
+      color.setGreenF(attr.value().toDouble());
+    } else if (attr.name() == QLatin1String("bf")) {
+      color.setBlueF(attr.value().toDouble());
+    } else if (attr.name() == QLatin1String("hex")) {
+      color = QColor::fromString(attr.value().toString());
+    }
+  }
+  f->SetValueAt(0, color);
+  f->SetDefaultData(color);
+  return f;
+}
+
+static EffectField* ParseStringDefaultField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs,
+                                            const char* default_attr_name, bool is_file) {
+  EffectField* f =
+      is_file ? static_cast<EffectField*>(new FileField(row, id)) : static_cast<EffectField*>(new StringField(row, id));
+  for (const auto& attr : attrs) {
+    if (attr.name() == QLatin1String(default_attr_name)) {
+      f->SetValueAt(0, attr.value().toString());
+      f->SetDefaultData(attr.value().toString());
+      break;
+    }
+  }
+  return f;
+}
+
+static EffectField* ParseBoolField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs) {
+  EffectField* f = new BoolField(row, id);
+  for (const auto& attr : attrs) {
+    if (attr.name() == QLatin1String("default")) {
+      bool v = (attr.value() == QLatin1String("1"));
+      f->SetValueAt(0, v);
+      f->SetDefaultData(v);
+      break;
+    }
+  }
+  return f;
+}
+
+static EffectField* ParseComboField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs,
+                                    QXmlStreamReader& reader) {
+  ComboField* f = new ComboField(row, id);
+  int combo_default_index = 0;
+  for (const auto& attr : attrs) {
+    if (attr.name() == QLatin1String("default")) {
+      combo_default_index = attr.value().toInt();
+      break;
+    }
+  }
+  int combo_item_count = 0;
+  while (!reader.atEnd() && !(reader.name() == QLatin1String("field") && reader.isEndElement())) {
+    reader.readNext();
+    if (reader.name() == QLatin1String("option") && reader.isStartElement()) {
+      reader.readNext();
+      f->AddItem(reader.text().toString(), combo_item_count++);
+    }
+  }
+  f->SetValueAt(0, combo_default_index);
+  f->SetDefaultData(combo_default_index);
+  return f;
+}
+
 void Effect::parseFieldElement(QXmlStreamReader& reader, EffectRow* row) {
   if (!row) {
     qWarning() << "parseFieldElement: row is null";
@@ -178,7 +402,6 @@ void Effect::parseFieldElement(QXmlStreamReader& reader, EffectRow* row) {
   int type = -1;
   QString id;
 
-  // Get field type and id from attributes
   const QXmlStreamAttributes& attributes = reader.attributes();
   for (const auto& attr : attributes) {
     if (attr.name() == QLatin1String("type")) {
@@ -193,104 +416,60 @@ void Effect::parseFieldElement(QXmlStreamReader& reader, EffectRow* row) {
     return;
   }
 
-  EffectField* field = nullptr;
-
   switch (type) {
-    case EffectField::EFFECT_FIELD_DOUBLE: {
-      DoubleField* double_field = new DoubleField(row, id);
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("default")) {
-          double_field->SetDefault(attr.value().toDouble());
-        } else if (attr.name() == QLatin1String("min")) {
-          double_field->SetMinimum(attr.value().toDouble());
-        } else if (attr.name() == QLatin1String("max")) {
-          double_field->SetMaximum(attr.value().toDouble());
-        }
-      }
-      field = double_field;
-    } break;
-    case EffectField::EFFECT_FIELD_COLOR: {
-      QColor color;
-      field = new ColorField(row, id);
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("r")) {
-          color.setRed(attr.value().toInt());
-        } else if (attr.name() == QLatin1String("g")) {
-          color.setGreen(attr.value().toInt());
-        } else if (attr.name() == QLatin1String("b")) {
-          color.setBlue(attr.value().toInt());
-        } else if (attr.name() == QLatin1String("rf")) {
-          color.setRedF(attr.value().toDouble());
-        } else if (attr.name() == QLatin1String("gf")) {
-          color.setGreenF(attr.value().toDouble());
-        } else if (attr.name() == QLatin1String("bf")) {
-          color.setBlueF(attr.value().toDouble());
-        } else if (attr.name() == QLatin1String("hex")) {
-          color = QColor::fromString(attr.value().toString());
-        }
-      }
-      field->SetValueAt(0, color);
-      field->SetDefaultData(color);
-    } break;
+    case EffectField::EFFECT_FIELD_DOUBLE:
+      ParseDoubleField(row, id, attributes);
+      break;
+    case EffectField::EFFECT_FIELD_COLOR:
+      ParseColorField(row, id, attributes);
+      break;
     case EffectField::EFFECT_FIELD_STRING:
-      field = new StringField(row, id);
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("default")) {
-          field->SetValueAt(0, attr.value().toString());
-          field->SetDefaultData(attr.value().toString());
-        }
-      }
+      ParseStringDefaultField(row, id, attributes, "default", false);
       break;
     case EffectField::EFFECT_FIELD_BOOL:
-      field = new BoolField(row, id);
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("default")) {
-          bool v = attr.value() == QLatin1String("1");
-          field->SetValueAt(0, v);
-          field->SetDefaultData(v);
-        }
-      }
+      ParseBoolField(row, id, attributes);
       break;
-    case EffectField::EFFECT_FIELD_COMBO: {
-      ComboField* combo_field = new ComboField(row, id);
-      int combo_default_index = 0;
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("default")) {
-          combo_default_index = attr.value().toInt();
-          break;
-        }
-      }
-      int combo_item_count = 0;
-      while (!reader.atEnd() && !(reader.name() == QLatin1String("field") && reader.isEndElement())) {
-        reader.readNext();
-        if (reader.name() == QLatin1String("option") && reader.isStartElement()) {
-          reader.readNext();
-          combo_field->AddItem(reader.text().toString(), combo_item_count);
-          combo_item_count++;
-        }
-      }
-      combo_field->SetValueAt(0, combo_default_index);
-      combo_field->SetDefaultData(combo_default_index);
-      field = combo_field;
-    } break;
+    case EffectField::EFFECT_FIELD_COMBO:
+      ParseComboField(row, id, attributes, reader);
+      break;
     case EffectField::EFFECT_FIELD_FONT:
-      field = new FontField(row, id);
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("default")) {
-          field->SetValueAt(0, attr.value().toString());
-          field->SetDefaultData(attr.value().toString());
-        }
-      }
+      ParseStringDefaultField(row, id, attributes, "default", false);
       break;
     case EffectField::EFFECT_FIELD_FILE:
-      field = new FileField(row, id);
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("filename")) {
-          field->SetValueAt(0, attr.value().toString());
-          field->SetDefaultData(attr.value().toString());
-        }
-      }
+      ParseStringDefaultField(row, id, attributes, "filename", true);
       break;
+  }
+}
+
+void Effect::parseRowElement(QXmlStreamReader& reader) {
+  QString row_name;
+  for (const auto& attr : reader.attributes()) {
+    if (attr.name() == QLatin1String("name")) {
+      row_name = attr.value().toString();
+      break;
+    }
+  }
+  if (row_name.isEmpty()) return;
+
+  EffectRow* row = new EffectRow(this, row_name);
+  while (!reader.atEnd() && !(reader.name() == QLatin1String("row") && reader.isEndElement())) {
+    reader.readNext();
+    if (reader.name() == QLatin1String("field") && reader.isStartElement()) {
+      parseFieldElement(reader, row);
+    }
+  }
+}
+
+void Effect::parseShaderElement(QXmlStreamReader& reader) {
+  SetFlags(Flags() | ShaderFlag);
+  for (const auto& attr : reader.attributes()) {
+    if (attr.name() == QLatin1String("vert")) {
+      vertPath = attr.value().toString();
+    } else if (attr.name() == QLatin1String("frag")) {
+      fragPath = attr.value().toString();
+    } else if (attr.name() == QLatin1String("iterations")) {
+      setIterations(attr.value().toInt());
+    }
   }
 }
 
@@ -305,34 +484,9 @@ void Effect::parseEffectXml() {
 
   while (!reader.atEnd()) {
     if (reader.name() == QLatin1String("row") && reader.isStartElement()) {
-      QString row_name;
-      const QXmlStreamAttributes& attributes = reader.attributes();
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("name")) {
-          row_name = attr.value().toString();
-        }
-      }
-      if (!row_name.isEmpty()) {
-        EffectRow* row = new EffectRow(this, row_name);
-        while (!reader.atEnd() && !(reader.name() == QLatin1String("row") && reader.isEndElement())) {
-          reader.readNext();
-          if (reader.name() == QLatin1String("field") && reader.isStartElement()) {
-            parseFieldElement(reader, row);
-          }
-        }
-      }
+      parseRowElement(reader);
     } else if (reader.name() == QLatin1String("shader") && reader.isStartElement()) {
-      SetFlags(Flags() | ShaderFlag);
-      const QXmlStreamAttributes& attributes = reader.attributes();
-      for (const auto& attr : attributes) {
-        if (attr.name() == QLatin1String("vert")) {
-          vertPath = attr.value().toString();
-        } else if (attr.name() == QLatin1String("frag")) {
-          fragPath = attr.value().toString();
-        } else if (attr.name() == QLatin1String("iterations")) {
-          setIterations(attr.value().toInt());
-        }
-      }
+      parseShaderElement(reader);
     }
     reader.readNext();
   }
@@ -345,13 +499,11 @@ Effect::~Effect() {
     close();
   }
 
-  // Clear graph editor if it's using one of these rows
-  if (panel_graph_editor != nullptr) {
+  // Clear graph editor if it's using one of these rows.
+  // Guard: during static destruction (exit()), app_ctx may already be null.
+  if (amber::app_ctx) {
     for (int i = 0; i < row_count(); i++) {
-      if (row(i) == panel_graph_editor->get_row()) {
-        panel_graph_editor->set_row(nullptr);
-        break;
-      }
+      amber::app_ctx->clearGraphEditorIfRow(row(i));
     }
   }
 
@@ -404,13 +556,13 @@ int Effect::gizmo_count() { return gizmos.size(); }
 
 void Effect::refresh() {}
 
-void Effect::FieldChanged() { update_ui(false); }
+void Effect::FieldChanged() { amber::app_ctx->updateUi(false); }
 
 void Effect::delete_self() {
   auto* cmd = new EffectDeleteCommand(this);
   cmd->setText(tr("Delete Effect"));
   amber::UndoStack.push(cmd);
-  update_ui(true);
+  amber::app_ctx->updateUi(true);
 }
 
 void Effect::move_up() {
@@ -425,8 +577,8 @@ void Effect::move_up() {
   command->from = index_of_effect;
   command->to = command->from - 1;
   amber::UndoStack.push(command);
-  panel_effect_controls->Reload();
-  panel_sequence_viewer->viewer_widget->frame_update();
+  amber::app_ctx->refreshEffectControls();
+  amber::app_ctx->refreshViewer();
 }
 
 void Effect::move_down() {
@@ -441,14 +593,14 @@ void Effect::move_down() {
   command->from = index_of_effect;
   command->to = command->from + 1;
   amber::UndoStack.push(command);
-  panel_effect_controls->Reload();
-  panel_sequence_viewer->viewer_widget->frame_update();
+  amber::app_ctx->refreshEffectControls();
+  amber::app_ctx->refreshViewer();
 }
 
 void Effect::save_to_file() {
   // save effect settings to file
-  QString file = QFileDialog::getSaveFileName(amber::MainWindow, tr("Save Effect Settings"), QString(),
-                                              tr("Effect XML Settings %1").arg("(*.xml)"));
+  QString file =
+      amber::app_ctx->showSaveFileDialog(tr("Save Effect Settings"), tr("Effect XML Settings %1").arg("(*.xml)"));
 
   // if the user picked a file
   if (!file.isEmpty()) {
@@ -463,16 +615,15 @@ void Effect::save_to_file() {
 
       file_handle.close();
     } else {
-      QMessageBox::critical(amber::MainWindow, tr("Save Settings Failed"),
-                            tr("Failed to open \"%1\" for writing.").arg(file), QMessageBox::Ok);
+      amber::app_ctx->showMessage(tr("Save Settings Failed"), tr("Failed to open \"%1\" for writing.").arg(file), 3);
     }
   }
 }
 
 void Effect::load_from_file() {
   // load effect settings from file
-  QString file = QFileDialog::getOpenFileName(amber::MainWindow, tr("Load Effect Settings"), QString(),
-                                              tr("Effect XML Settings %1").arg("(*.xml)"));
+  QString file =
+      amber::app_ctx->showOpenFileDialog(tr("Load Effect Settings"), tr("Effect XML Settings %1").arg("(*.xml)"));
 
   // if the user picked a file
   if (!file.isEmpty()) {
@@ -484,10 +635,9 @@ void Effect::load_from_file() {
 
       file_handle.close();
 
-      update_ui(false);
+      amber::app_ctx->updateUi(false);
     } else {
-      QMessageBox::critical(amber::MainWindow, tr("Load Settings Failed"),
-                            tr("Failed to open \"%1\" for reading.").arg(file), QMessageBox::Ok);
+      amber::app_ctx->showMessage(tr("Load Settings Failed"), tr("Failed to open \"%1\" for reading.").arg(file), 3);
     }
   }
 }
@@ -514,76 +664,7 @@ void Effect::load(QXmlStreamReader& stream) {
     stream.readNext();
     if (stream.name() == QLatin1String("row") && stream.isStartElement()) {
       if (row_count < rows.size()) {
-        EffectRow* row = rows.at(row_count);
-
-        while (!stream.atEnd() && !(stream.name() == QLatin1String("row") && stream.isEndElement())) {
-          stream.readNext();
-
-          // read field
-          if (stream.name() == QLatin1String("field") && stream.isStartElement()) {
-            int field_number = -1;
-
-            // match field using ID
-            for (int k = 0; k < stream.attributes().size(); k++) {
-              const QXmlStreamAttribute& attr = stream.attributes().at(k);
-              if (attr.name() == QLatin1String("id")) {
-                for (int l = 0; l < row->FieldCount(); l++) {
-                  if (row->Field(l)->id() == attr.value()) {
-                    field_number = l;
-                    break;
-                  }
-                }
-                break;
-              }
-            }
-
-            if (field_number > -1) {
-              EffectField* field = row->Field(field_number);
-
-              // get current field value
-              for (int k = 0; k < stream.attributes().size(); k++) {
-                const QXmlStreamAttribute& attr = stream.attributes().at(k);
-                if (attr.name() == QLatin1String("value")) {
-                  field->persistent_data_ = field->ConvertStringToValue(attr.value().toString());
-                  break;
-                }
-              }
-
-              while (!stream.atEnd() && !(stream.name() == QLatin1String("field") && stream.isEndElement())) {
-                stream.readNext();
-
-                // read keyframes
-                if (stream.name() == QLatin1String("key") && stream.isStartElement()) {
-                  row->SetKeyframingInternal(true);
-
-                  EffectKeyframe key;
-                  for (int k = 0; k < stream.attributes().size(); k++) {
-                    const QXmlStreamAttribute& attr = stream.attributes().at(k);
-                    if (attr.name() == QLatin1String("value")) {
-                      key.data = field->ConvertStringToValue(attr.value().toString());
-                    } else if (attr.name() == QLatin1String("frame")) {
-                      key.time = attr.value().toLong();
-                    } else if (attr.name() == QLatin1String("type")) {
-                      key.type = attr.value().toInt();
-                    } else if (attr.name() == QLatin1String("prehx")) {
-                      key.pre_handle_x = attr.value().toDouble();
-                    } else if (attr.name() == QLatin1String("prehy")) {
-                      key.pre_handle_y = attr.value().toDouble();
-                    } else if (attr.name() == QLatin1String("posthx")) {
-                      key.post_handle_x = attr.value().toDouble();
-                    } else if (attr.name() == QLatin1String("posthy")) {
-                      key.post_handle_y = attr.value().toDouble();
-                    }
-                  }
-                  field->keyframes.append(key);
-                }
-              }
-
-              field->Changed();
-            }
-          }
-        }
-
+        LoadRowElement(stream, rows.at(row_count));
       } else {
         qCritical() << "Too many rows for effect" << id << ". Project might be corrupt. (Got" << row_count
                     << ", expected <" << rows.size() - 1 << ")";
@@ -657,8 +738,8 @@ void Effect::load_from_string(const QByteArray& s) {
             // pass off to standard loading function
             load(stream);
           } else {
-            QMessageBox::critical(amber::MainWindow, tr("Load Settings Failed"),
-                                  tr("This settings file doesn't match this effect."), QMessageBox::Ok);
+            amber::app_ctx->showMessage(tr("Load Settings Failed"), tr("This settings file doesn't match this effect."),
+                                        3);
           }
           break;
         }
@@ -840,8 +921,7 @@ EffectPtr Effect::copy(Clip* c) {
   return copy;
 }
 
-void Effect::process_shader(double timecode, GLTextureCoords&, int iteration, QByteArray& uboData,
-                            QSize renderSize) {
+void Effect::process_shader(double timecode, GLTextureCoords&, int iteration, QByteArray& uboData, QSize renderSize) {
   if (uboData.size() < fragUboSize_) uboData.resize(fragUboSize_);
 
   // Use actual FBO/render size for resolution uniforms (shaders that use gl_FragCoord need this
@@ -849,60 +929,8 @@ void Effect::process_shader(double timecode, GLTextureCoords&, int iteration, QB
   float resW = renderSize.isValid() ? float(renderSize.width()) : float(parent_clip->media_width());
   float resH = renderSize.isValid() ? float(renderSize.height()) : float(parent_clip->media_height());
 
-  // Set automatic uniforms by looking up their entries
-  for (const auto& entry : uniformEntries_) {
-    if (entry.name == QLatin1String("resolution")) {
-      float res[2] = {resW, resH};
-      memcpy(uboData.data() + entry.offset, res, qMin(entry.size, 8));
-    } else if (entry.name == QLatin1String("resolution_x")) {
-      memcpy(uboData.data() + entry.offset, &resW, 4);
-    } else if (entry.name == QLatin1String("resolution_y")) {
-      memcpy(uboData.data() + entry.offset, &resH, 4);
-    } else if (entry.name == QLatin1String("time")) {
-      float v = float(timecode);
-      memcpy(uboData.data() + entry.offset, &v, 4);
-    } else if (entry.name == QLatin1String("iteration")) {
-      int v = iteration;
-      memcpy(uboData.data() + entry.offset, &v, 4);
-    }
-  }
-
-  // Set field uniforms by name lookup
-  for (int r = 0; r < row_count(); r++) {
-    EffectRow* erow = row(r);
-    for (int j = 0; j < erow->FieldCount(); j++) {
-      EffectField* field = erow->Field(j);
-      if (field->id().isEmpty()) continue;
-      // Find matching uniform entry
-      for (const auto& entry : uniformEntries_) {
-        if (entry.name == field->id()) {
-          switch (field->type()) {
-            case EffectField::EFFECT_FIELD_DOUBLE: {
-              float v = float(static_cast<DoubleField*>(field)->GetDoubleAt(timecode));
-              memcpy(uboData.data() + entry.offset, &v, 4);
-            } break;
-            case EffectField::EFFECT_FIELD_COLOR: {
-              ColorField* cf = static_cast<ColorField*>(field);
-              float rgb[3] = {float(cf->GetColorAt(timecode).redF()), float(cf->GetColorAt(timecode).greenF()),
-                              float(cf->GetColorAt(timecode).blueF())};
-              memcpy(uboData.data() + entry.offset, rgb, qMin(entry.size, 12));
-            } break;
-            case EffectField::EFFECT_FIELD_BOOL: {
-              int v = field->GetValueAt(timecode).toBool() ? 1 : 0;  // GLSL bool = 4 bytes
-              memcpy(uboData.data() + entry.offset, &v, 4);
-            } break;
-            case EffectField::EFFECT_FIELD_COMBO: {
-              int v = field->GetValueAt(timecode).toInt();
-              memcpy(uboData.data() + entry.offset, &v, 4);
-            } break;
-            default:
-              break;
-          }
-          break;  // found matching entry
-        }
-      }
-    }
-  }
+  WriteAutoUniforms(uniformEntries_, timecode, iteration, resW, resH, uboData);
+  WriteFieldUniforms(this, uniformEntries_, timecode, uboData);
 }
 
 void Effect::process_coords(double, GLTextureCoords&, int) {}
@@ -945,56 +973,36 @@ void Effect::process_audio(double, double, quint8*, int, int) {}
 void Effect::gizmo_draw(double, GLTextureCoords&) {}
 
 void Effect::gizmo_move(EffectGizmo* gizmo, int x_movement, int y_movement, double timecode, bool done) {
-  // Loop through each gizmo to find `gizmo`
-  for (auto i : gizmos) {
-    if (i == gizmo) {
-      if (!done && gizmo_dragging_actions_.isEmpty()) {
-        if (gizmo->x_field1 != nullptr) {
-          gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->x_field1));
-        }
-        if (gizmo->y_field1 != nullptr) {
-          gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->y_field1));
-        }
-        if (gizmo->x_field2 != nullptr) {
-          gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->x_field2));
-        }
-        if (gizmo->y_field2 != nullptr) {
-          gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->y_field2));
-        }
-      }
+  // Verify gizmo belongs to this effect
+  if (!gizmos.contains(gizmo)) return;
 
-      // Update the field values
-      if (gizmo->x_field1 != nullptr) {
-        gizmo->x_field1->SetValueAt(timecode,
-                                    gizmo->x_field1->GetDoubleAt(timecode) + x_movement * gizmo->x_field_multi1);
-      }
-      if (gizmo->y_field1 != nullptr) {
-        gizmo->y_field1->SetValueAt(timecode,
-                                    gizmo->y_field1->GetDoubleAt(timecode) + y_movement * gizmo->y_field_multi1);
-      }
-      if (gizmo->x_field2 != nullptr) {
-        gizmo->x_field2->SetValueAt(timecode,
-                                    gizmo->x_field2->GetDoubleAt(timecode) + x_movement * gizmo->x_field_multi2);
-      }
-      if (gizmo->y_field2 != nullptr) {
-        gizmo->y_field2->SetValueAt(timecode,
-                                    gizmo->y_field2->GetDoubleAt(timecode) + y_movement * gizmo->y_field_multi2);
-      }
+  // On drag start, record undo snapshots for each bound field
+  if (!done && gizmo_dragging_actions_.isEmpty()) {
+    if (gizmo->x_field1 != nullptr) gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->x_field1));
+    if (gizmo->y_field1 != nullptr) gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->y_field1));
+    if (gizmo->x_field2 != nullptr) gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->x_field2));
+    if (gizmo->y_field2 != nullptr) gizmo_dragging_actions_.append(new KeyframeDataChange(gizmo->y_field2));
+  }
 
-      if (done && !gizmo_dragging_actions_.isEmpty()) {
-        ComboAction* ca = new ComboAction(tr("Move Gizmo"));
+  // Update field values
+  if (gizmo->x_field1 != nullptr)
+    gizmo->x_field1->SetValueAt(timecode, gizmo->x_field1->GetDoubleAt(timecode) + x_movement * gizmo->x_field_multi1);
+  if (gizmo->y_field1 != nullptr)
+    gizmo->y_field1->SetValueAt(timecode, gizmo->y_field1->GetDoubleAt(timecode) + y_movement * gizmo->y_field_multi1);
+  if (gizmo->x_field2 != nullptr)
+    gizmo->x_field2->SetValueAt(timecode, gizmo->x_field2->GetDoubleAt(timecode) + x_movement * gizmo->x_field_multi2);
+  if (gizmo->y_field2 != nullptr)
+    gizmo->y_field2->SetValueAt(timecode, gizmo->y_field2->GetDoubleAt(timecode) + y_movement * gizmo->y_field_multi2);
 
-        for (auto gizmo_dragging_action : gizmo_dragging_actions_) {
-          gizmo_dragging_action->SetNewKeyframes();
-          ca->append(gizmo_dragging_action);
-        }
-
-        amber::UndoStack.push(ca);
-
-        gizmo_dragging_actions_.clear();
-      }
-      break;
+  // On drag end, push the undo action
+  if (done && !gizmo_dragging_actions_.isEmpty()) {
+    ComboAction* ca = new ComboAction(tr("Move Gizmo"));
+    for (auto gizmo_dragging_action : gizmo_dragging_actions_) {
+      gizmo_dragging_action->SetNewKeyframes();
+      ca->append(gizmo_dragging_action);
     }
+    amber::UndoStack.push(ca);
+    gizmo_dragging_actions_.clear();
   }
 }
 
@@ -1035,10 +1043,11 @@ bool Effect::valueHasChanged(double timecode) {
       EffectRow* crow = row(i);
       for (int j = 0; j < crow->FieldCount(); j++) {
         EffectField* field = crow->Field(j);
-        if (cachedValues.at(index) != field->GetValueAt(timecode)) {
+        QVariant val = field->GetValueAt(timecode);
+        if (cachedValues.at(index) != val) {
           changed = true;
         }
-        cachedValues[index] = field->GetValueAt(timecode);
+        cachedValues[index] = val;
         index++;
       }
     }

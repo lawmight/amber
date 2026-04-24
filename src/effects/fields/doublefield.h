@@ -2,7 +2,7 @@
 #define DOUBLEFIELD_H
 
 #include "../effectfield.h"
-#include "ui/labelslider.h"
+#include "core/displaytype.h"
 
 /**
  * @brief The DoubleField class
@@ -10,10 +10,9 @@
  * An EffectField derivative the produces number values (integer or floating-point) and uses a LabelSlider as its
  * visual representation.
  */
-class DoubleField : public EffectField
-{
+class DoubleField : public EffectField {
   Q_OBJECT
-public:
+ public:
   /**
    * @brief Reimplementation of EffectField::EffectField().
    */
@@ -50,9 +49,9 @@ public:
   void SetDefault(double d);
 
   /**
-   * @brief Sets the UI display type to a member of LabelSlider::DisplayType.
+   * @brief Sets the UI display type to a member of amber::DisplayType.
    */
-  void SetDisplayType(LabelSlider::DisplayType type);
+  void SetDisplayType(amber::DisplayType type);
 
   /**
    * @brief For a timecode-based display type, sets the frame rate to be used for the displayed timecode
@@ -60,6 +59,12 @@ public:
    * \see SetDisplayType() and LabelSlider::SetFrameRate().
    */
   void SetFrameRate(const double& rate);
+
+  int GetDisplayType() const { return static_cast<int>(display_type_); }
+  double GetMinimum() const { return min_; }
+  double GetMaximum() const { return max_; }
+  double GetDefault() const { return default_; }
+  double GetFrameRate() const { return frame_rate_; }
 
   /**
    * @brief Reimplementation of EffectField::ConvertStringToValue()
@@ -71,18 +76,7 @@ public:
    */
   QString ConvertValueToString(const QVariant& v) override;
 
-  /**
-   * @brief Reimplementation of EffectField::CreateWidget()
-   *
-   * Creates and connects to a LabelSlider.
-   */
-  QWidget* CreateWidget(QWidget *existing = nullptr) override;
-
-  /**
-   * @brief Reimplementation of EffectField::UpdateWidgetValue()
-   */
-  void UpdateWidgetValue(QWidget* widget, double timecode) override;
-signals:
+ signals:
   /**
    * @brief Signal emitted when the field's maximum value has changed
    *
@@ -116,7 +110,8 @@ signals:
    * The new minimum value.
    */
   void MinimumChanged(double minimum);
-private:
+
+ private:
   /**
    * @brief Internal minimum value
    *
@@ -143,7 +138,7 @@ private:
    *
    * \see SetDisplayType().
    */
-  LabelSlider::DisplayType display_type_{LabelSlider::Normal};
+  amber::DisplayType display_type_{amber::DisplayType::Normal};
 
   /**
    * @brief Internal frame rate value
@@ -159,30 +154,12 @@ private:
    */
   bool value_set_{false};
 
-  /**
-   * @brief An internal KeyframeDataChange undoable command
-   *
-   * This is stored to allow for the value to be changed by dragging without every single "step" being pushed to
-   * the undo stack. Instead an undo command can be created at the start of a drag, and then pushed at the end
-   * to make it one single undoable action.
-   */
-  KeyframeDataChange* kdc_{nullptr};
-private slots:
+ private slots:
   /**
    * @brief Connected to EffectField::Changed() to ensure value_set_ gets set to TRUE whenever a value is set on this
    * field.
    */
   void ValueHasBeenSet();
-
-  /**
-   * @brief Internal function connected to any QWidget made from CreateWidget() to update the value based on user input
-   *
-   * @param b
-   *
-   * The current number value of the QWidget (LabelSlider in this case). Automatically set when this slot is connected
-   * to the LabelSlider::valueChanged() signal.
-   */
-  void UpdateFromWidget(double d);
 };
 
-#endif // DOUBLEFIELD_H
+#endif  // DOUBLEFIELD_H

@@ -29,22 +29,18 @@ extern "C" {
 #include <QScreen>
 #include <utility>
 
-#include "engine/clip.h"
-#include "engine/sequence.h"
 #include "effects/effect.h"
 #include "effects/transition.h"
+#include "engine/clip.h"
+#include "engine/sequence.h"
 #include "project/footage.h"
 #include "project/media.h"
 
-#include "ui/collapsiblewidget.h"
-
 #include "rendering/audio.h"
+#include "rendering/renderthread.h"
 
 #include "core/math.h"
 #include "global/config.h"
-
-#include "panels/timeline.h"
-#include "panels/viewer.h"
 
 // Depth-only correction for intermediate offscreen passes (no Y-flip).
 // Remaps OpenGL depth range [-1,1] to [0,1] for Vulkan/Metal/D3D.
@@ -59,31 +55,37 @@ static QMatrix4x4 depthCorrMatrix(QRhi* rhi) {
 
 // Helper: create a temporary pipeline, draw a fullscreen blit, then destroy the pipeline.
 // This replaces the old draw_clip() / full_blit() pattern.
+static bool rhi_blit_check_params(const char* caller, ComposeSequenceParams& params, QRhiTextureRenderTarget* target,
+                                  QRhiRenderPassDescriptor* rpd, QRhiTexture* srcTex) {
+  if (!params.rhi) {
+    qWarning() << caller << "params.rhi is null";
+    return false;
+  }
+  if (!params.cb) {
+    qWarning() << caller << "params.cb is null";
+    return false;
+  }
+  if (!target) {
+    qWarning() << caller << "target is null";
+    return false;
+  }
+  if (!rpd) {
+    qWarning() << caller << "rpd is null";
+    return false;
+  }
+  if (!srcTex) {
+    qWarning() << caller << "srcTex is null";
+    return false;
+  }
+  return true;
+}
+
 static void rhi_blit(ComposeSequenceParams& params, QRhiTextureRenderTarget* target, QRhiRenderPassDescriptor* rpd,
                      QRhiTexture* srcTex, const QShader& vertShader, const QShader& fragShader, const QMatrix4x4& mvp,
                      const QByteArray& fragUboData, int fragUboSize, int texBindingCount = 1,
                      QRhiTexture* extraTex1 = nullptr, QRhiTexture* extraTex2 = nullptr,
                      bool skipClipSpaceCorr = false) {
-  if (!params.rhi) {
-    qWarning() << "rhi_blit: params.rhi is null";
-    return;
-  }
-  if (!params.cb) {
-    qWarning() << "rhi_blit: params.cb is null";
-    return;
-  }
-  if (!target) {
-    qWarning() << "rhi_blit: target is null";
-    return;
-  }
-  if (!rpd) {
-    qWarning() << "rhi_blit: rpd is null";
-    return;
-  }
-  if (!srcTex) {
-    qWarning() << "rhi_blit: srcTex is null";
-    return;
-  }
+  if (!rhi_blit_check_params("rhi_blit:", params, target, rpd, srcTex)) return;
   QRhi* rhi = params.rhi;
   QRhiCommandBuffer* cb = params.cb;
 
@@ -187,26 +189,7 @@ static void rhi_blit(ComposeSequenceParams& params, QRhiTextureRenderTarget* tar
 static void rhi_blit_srcover(ComposeSequenceParams& params, QRhiTextureRenderTarget* target,
                              QRhiRenderPassDescriptor* rpd, QRhiTexture* srcTex, float opacity = 1.0f,
                              bool skipClipSpaceCorr = false) {
-  if (!params.rhi) {
-    qWarning() << "rhi_blit_srcover: params.rhi is null";
-    return;
-  }
-  if (!params.cb) {
-    qWarning() << "rhi_blit_srcover: params.cb is null";
-    return;
-  }
-  if (!target) {
-    qWarning() << "rhi_blit_srcover: target is null";
-    return;
-  }
-  if (!rpd) {
-    qWarning() << "rhi_blit_srcover: rpd is null";
-    return;
-  }
-  if (!srcTex) {
-    qWarning() << "rhi_blit_srcover: srcTex is null";
-    return;
-  }
+  if (!rhi_blit_check_params("rhi_blit_srcover:", params, target, rpd, srcTex)) return;
   QRhi* rhi = params.rhi;
   QRhiCommandBuffer* cb = params.cb;
 
@@ -335,8 +318,7 @@ static ClipRhiResources* get_or_create_clip_resources(Clip* c, QRhi* rhi, int wi
     for (int j = 0; j < fbo_count; j++) {
       res->tex[j] = rhi->newTexture(QRhiTexture::RGBA8, QSize(width, height), 1, QRhiTexture::RenderTarget);
       res->tex[j]->create();
-      res->rt[j] = rhi->newTextureRenderTarget(
-          {res->tex[j]}, QRhiTextureRenderTarget::PreserveColorContents);
+      res->rt[j] = rhi->newTextureRenderTarget({res->tex[j]}, QRhiTextureRenderTarget::PreserveColorContents);
       if (j == 0) {
         res->rpd = res->rt[j]->newCompatibleRenderPassDescriptor();
       }
@@ -363,6 +345,44 @@ static ClipRhiResources* get_or_create_clip_resources(Clip* c, QRhi* rhi, int wi
   return static_cast<ClipRhiResources*>(c->fbo_rhi);
 }
 
+// Apply the superimpose pass for an effect (called from process_effect when SuperimposeFlag is set).
+static void apply_superimpose_effect(Clip* c, Effect* e, double timecode, QRhiTexture*& composite_texture,
+                                     bool& fbo_switcher, bool& texture_failed, ComposeSequenceParams& params) {
+  QRhiResourceUpdateBatch* upload = params.rhi->nextResourceUpdateBatch();
+  QRhiTexture* superimpose_texture = e->process_superimpose(params.rhi, upload, timecode);
+  if (c->fbo_rhi == nullptr) {
+    upload->release();
+    e->endEffect();
+    return;
+  }
+  ClipRhiResources* res = static_cast<ClipRhiResources*>(c->fbo_rhi);
+
+  if (superimpose_texture == nullptr) {
+    qWarning() << "Superimpose texture was nullptr, retrying...";
+    texture_failed = true;
+    upload->release();
+    e->endEffect();
+    return;
+  }
+  QColor clearColor(0, 0, 0, 0);
+  params.cb->beginPass(res->rt[!fbo_switcher], clearColor, {1.0f, 0}, upload);
+  params.cb->endPass();
+
+  if (composite_texture == nullptr) {
+    // No existing composite — use superimpose directly
+    composite_texture = superimpose_texture;
+    e->endEffect();
+    return;
+  }
+  // Copy composite to fbo if not already there
+  if (composite_texture != res->tex[0] && composite_texture != res->tex[1]) {
+    rhi_blit_passthrough(params, res->rt[!fbo_switcher], res->rpd, composite_texture, 1.0f, /*skipClipSpaceCorr=*/true);
+  }
+  rhi_blit_srcover(params, res->rt[!fbo_switcher], res->rpd, superimpose_texture, 1.0f, /*skipClipSpaceCorr=*/true);
+  composite_texture = res->tex[!fbo_switcher];
+  e->endEffect();
+}
+
 static void process_effect(Clip* c, Effect* e, double timecode, GLTextureCoords& coords,
                            QRhiTexture*& composite_texture, bool& fbo_switcher, bool& texture_failed, int data,
                            ComposeSequenceParams& params) {
@@ -374,80 +394,58 @@ static void process_effect(Clip* c, Effect* e, double timecode, GLTextureCoords&
     qWarning() << "process_effect: e is null";
     return;
   }
-  if (e->IsEnabled()) {
-    if (e->Flags() & Effect::CoordsFlag) {
-      e->process_coords(timecode, coords, data);
-    }
-    bool can_process_shaders = ((e->Flags() & Effect::ShaderFlag) && amber::CurrentRuntimeConfig.shaders_are_enabled);
-    if (can_process_shaders || (e->Flags() & Effect::SuperimposeFlag)) {
-      e->startEffect();
+  if (!e->IsEnabled()) return;
 
-      bool has_shader = can_process_shaders && e->is_glsl_linked();
+  if (e->Flags() & Effect::CoordsFlag) {
+    e->process_coords(timecode, coords, data);
+  }
+  bool can_process_shaders = ((e->Flags() & Effect::ShaderFlag) && amber::CurrentRuntimeConfig.shaders_are_enabled);
+  if (!can_process_shaders && !(e->Flags() & Effect::SuperimposeFlag)) return;
 
-      if (has_shader && composite_texture != nullptr && c->fbo_rhi != nullptr) {
-        ClipRhiResources* res = static_cast<ClipRhiResources*>(c->fbo_rhi);
-        QMatrix4x4 blitMvp;
-        blitMvp.ortho(-1, 1, -1, 1, -1, 1);
+  e->startEffect();
 
-        for (int i = 0; i < e->getIterations(); i++) {
-          // Fill UBO data via the effect's process_shader
-          QByteArray uboData;
-          uboData.resize(qMax(e->fragUboSize(), e->vertUboSize()));
-          uboData.fill(0);
-          e->process_shader(timecode, coords, i, uboData, res->tex[0]->pixelSize());
+  if (can_process_shaders && e->is_glsl_linked() && composite_texture != nullptr && c->fbo_rhi != nullptr) {
+    ClipRhiResources* res = static_cast<ClipRhiResources*>(c->fbo_rhi);
+    QMatrix4x4 blitMvp;
+    blitMvp.ortho(-1, 1, -1, 1, -1, 1);
 
-          // Blit through effect shader into the next FBO (skip clipSpaceCorr — intermediate pass)
-          rhi_blit(params, res->rt[fbo_switcher], res->rpd, composite_texture, e->vertexShader(), e->fragmentShader(),
-                   blitMvp, uboData, qMax(e->fragUboSize(), e->vertUboSize()), 1, nullptr, nullptr,
-                   /*skipClipSpaceCorr=*/true);
-          composite_texture = res->tex[fbo_switcher];
-          fbo_switcher = !fbo_switcher;
-        }
-      }
-
-      if (e->Flags() & Effect::SuperimposeFlag) {
-        QRhiResourceUpdateBatch* upload = params.rhi->nextResourceUpdateBatch();
-        QRhiTexture* superimpose_texture = e->process_superimpose(params.rhi, upload, timecode);
-        // Submit upload in a dummy pass
-        if (c->fbo_rhi == nullptr) {
-          upload->release();
-          e->endEffect();
-          return;
-        }
-        ClipRhiResources* res = static_cast<ClipRhiResources*>(c->fbo_rhi);
-
-        if (superimpose_texture == nullptr) {
-          qWarning() << "Superimpose texture was nullptr, retrying...";
-          texture_failed = true;
-          upload->release();
-        } else if (composite_texture == nullptr) {
-          // No existing composite — just submit upload and use superimpose directly
-          QColor clearColor(0, 0, 0, 0);
-          params.cb->beginPass(res->rt[!fbo_switcher], clearColor, {1.0f, 0}, upload);
-          params.cb->endPass();
-          composite_texture = superimpose_texture;
-        } else {
-          // Composite: blit existing texture, then overlay superimpose
-          // First submit the texture upload
-          QColor clearColor(0, 0, 0, 0);
-          params.cb->beginPass(res->rt[!fbo_switcher], clearColor, {1.0f, 0}, upload);
-          params.cb->endPass();
-
-          // Copy composite to fbo if not already there (fullscreen opaque blit overwrites all pixels,
-          // so PreserveColorContents is harmless — stale data from previous frames is replaced)
-          if (composite_texture != res->tex[0] && composite_texture != res->tex[1]) {
-            rhi_blit_passthrough(params, res->rt[!fbo_switcher], res->rpd, composite_texture,
-                                 1.0f, /*skipClipSpaceCorr=*/true);
-          }
-          // Overlay superimpose with alpha blending (PreserveColorContents keeps the composite)
-          rhi_blit_srcover(params, res->rt[!fbo_switcher], res->rpd, superimpose_texture,
-                           1.0f, /*skipClipSpaceCorr=*/true);
-          composite_texture = res->tex[!fbo_switcher];
-        }
-      }
-      e->endEffect();
+    for (int i = 0; i < e->getIterations(); i++) {
+      QByteArray uboData;
+      uboData.resize(qMax(e->fragUboSize(), e->vertUboSize()));
+      uboData.fill(0);
+      e->process_shader(timecode, coords, i, uboData, res->tex[0]->pixelSize());
+      rhi_blit(params, res->rt[fbo_switcher], res->rpd, composite_texture, e->vertexShader(), e->fragmentShader(),
+               blitMvp, uboData, qMax(e->fragUboSize(), e->vertUboSize()), 1, nullptr, nullptr,
+               /*skipClipSpaceCorr=*/true);
+      composite_texture = res->tex[fbo_switcher];
+      fbo_switcher = !fbo_switcher;
     }
   }
+
+  if (e->Flags() & Effect::SuperimposeFlag) {
+    apply_superimpose_effect(c, e, timecode, composite_texture, fbo_switcher, texture_failed, params);
+    return;  // apply_superimpose_effect calls e->endEffect() on all paths
+  }
+}
+
+// Determine if a footage clip should be active and open/close accordingly.
+// Returns true if the clip is active; sets texture_failed on not-ready footage.
+static bool activate_footage_clip(Clip* c, long playhead, bool& texture_failed, int& audio_track_count) {
+  Footage* m = c->media()->to_footage();
+  if (m->invalid || (c->track() >= 0 && !is_audio_device_set())) return false;
+  if (!m->ready) {
+    texture_failed = true;
+    return false;
+  }
+  const FootageStream* ms = c->media_stream();
+  if (ms != nullptr && c->IsActiveAt(playhead)) {
+    if (c->NeedsCacherReconfigure()) c->Close(false);
+    if (!c->IsOpen()) c->Open();
+    if (c->track() >= 0) audio_track_count++;
+    return true;
+  }
+  if (c->IsOpen()) c->Close(false);
+  return false;
 }
 
 // Collect active clips for the current playhead, open/close as needed, and sort video clips by track.
@@ -466,54 +464,30 @@ static QVector<Clip*> collect_active_clips(Sequence* s, long playhead, ComposeSe
     if ((c->track() < 0) != params.video) continue;
 
     bool clip_is_active = false;
-
     if (c->media() != nullptr && c->media()->get_type() == MEDIA_TYPE_FOOTAGE) {
-      Footage* m = c->media()->to_footage();
-      if (!m->invalid && !(c->track() >= 0 && !is_audio_device_set())) {
-        if (m->ready) {
-          const FootageStream* ms = c->media_stream();
-          if (ms != nullptr && c->IsActiveAt(playhead)) {
-            if (c->NeedsCacherReconfigure()) {
-              c->Close(false);
-            }
-            if (!c->IsOpen()) {
-              c->Open();
-            }
-            clip_is_active = true;
-            if (c->track() >= 0) audio_track_count++;
-          } else if (c->IsOpen()) {
-            c->Close(false);
-          }
-        } else {
-          params.texture_failed = true;
-        }
-      }
+      clip_is_active = activate_footage_clip(c, playhead, params.texture_failed, audio_track_count);
     } else {
       if (c->IsActiveAt(playhead)) {
-        if (!c->IsOpen()) {
-          c->Open();
-        }
+        if (!c->IsOpen()) c->Open();
         clip_is_active = true;
       } else if (c->IsOpen()) {
         c->Close(false);
       }
     }
 
-    if (clip_is_active) {
-      bool added = false;
-      if (params.video) {
-        for (int j = 0; j < current_clips.size(); j++) {
-          if (current_clips.at(j)->track() < c->track()) {
-            current_clips.insert(j, c);
-            added = true;
-            break;
-          }
+    if (!clip_is_active) continue;
+
+    bool added = false;
+    if (params.video) {
+      for (int j = 0; j < current_clips.size(); j++) {
+        if (current_clips.at(j)->track() < c->track()) {
+          current_clips.insert(j, c);
+          added = true;
+          break;
         }
       }
-      if (!added) {
-        current_clips.append(c);
-      }
     }
+    if (!added) current_clips.append(c);
   }
 
   return current_clips;
@@ -619,44 +593,9 @@ static void render_clip_to_backbuffer(ComposeSequenceParams& params, QRhiTexture
   params.transientResources.append(clipFragUbo);
 }
 
-// Composite a single video clip: retrieve texture, apply effects/transitions, render to back buffer,
-// then blend onto the final compositing target. Sets gizmos_drawn if this clip's gizmos were processed.
-static void composite_video_clip(Clip* c, long playhead, Sequence* s, ComposeSequenceParams& params,
-                                 const QMatrix4x4& sequence_ortho, QRhiTextureRenderTarget* final_target,
-                                 bool& gizmos_drawn) {
-  if (!c) {
-    qWarning() << "composite_video_clip: c is null";
-    return;
-  }
-  if (!s) {
-    qWarning() << "composite_video_clip: s is null";
-    return;
-  }
-  if (!final_target) {
-    qWarning() << "composite_video_clip: final_target is null";
-    return;
-  }
-  int video_width = c->media_width();
-  int video_height = c->media_height();
-
-  if (playhead < c->timeline_in(true) || playhead >= c->timeline_out(true)) return;
-
-  QRhiTexture* textureID = nullptr;
-
-  if (c->media() != nullptr && c->media()->get_type() == MEDIA_TYPE_FOOTAGE) {
-    c->Cache(qMax(playhead, c->timeline_in()), params.scrubbing, params.nests, params.playback_speed);
-    if (!c->Retrieve(params.rhi, params.cb, &params)) {
-      params.texture_failed = true;
-    }
-    // Always use cached texture — on Retrieve failure, hold the last decoded frame
-    // instead of skipping the clip (which lets lower tracks bleed through during scrub).
-    textureID = c->cached_rhi_tex;
-  }
-
-  // Create clip FBO resources at compositing resolution (respects preview divider)
-  QSize comp_size = params.main_tex->pixelSize();
+// Ensure clip FBO resources exist at the given compositing resolution, invalidating if resolution changed.
+static void ensure_clip_fbo(Clip* c, QRhi* rhi, const QSize& comp_size) {
   if (c->fbo_rhi != nullptr) {
-    // Invalidate if compositing resolution changed
     ClipRhiResources* existing = static_cast<ClipRhiResources*>(c->fbo_rhi);
     if (existing->tex[0] != nullptr && existing->tex[0]->pixelSize() != comp_size) {
       QVector<QRhiResource*> to_delete;
@@ -675,72 +614,62 @@ static void composite_video_clip(Clip* c, long playhead, Sequence* s, ComposeSeq
     }
   }
   if (c->fbo_rhi == nullptr) {
-    get_or_create_clip_resources(c, params.rhi, comp_size.width(), comp_size.height());
+    get_or_create_clip_resources(c, rhi, comp_size.width(), comp_size.height());
   }
+}
 
-  bool fbo_switcher = false;
-  ClipRhiResources* res = static_cast<ClipRhiResources*>(c->fbo_rhi);
+// Retrieve and optionally premultiply the clip texture. Returns the texture to composite (may be null).
+static QRhiTexture* prepare_clip_texture(Clip* c, long playhead, bool& fbo_switcher, ComposeSequenceParams& params) {
+  QRhiTexture* textureID = nullptr;
 
-  if (c->media() != nullptr) {
-    if (c->media()->get_type() == MEDIA_TYPE_SEQUENCE) {
-      // Circular reference guard: skip if this sequence is already in the nesting stack
-      Sequence* nested_seq = c->media()->to_sequence().get();
-      bool circular = false;
+  if (c->media() == nullptr) return nullptr;
+
+  if (c->media()->get_type() == MEDIA_TYPE_FOOTAGE) {
+    c->Cache(qMax(playhead, c->timeline_in()), params.scrubbing, params.nests, params.playback_speed);
+    if (!c->Retrieve(params.rhi, params.cb, &params)) params.texture_failed = true;
+    textureID = c->cached_rhi_tex;
+
+    if (textureID != nullptr && !c->media()->to_footage()->alpha_is_premultiplied) {
+      ClipRhiResources* res = static_cast<ClipRhiResources*>(c->fbo_rhi);
+      QMatrix4x4 blitMvp;
+      blitMvp.ortho(-1, 1, -1, 1, -1, 1);
+      QByteArray emptyFrag;
+      rhi_blit(params, res->rt[0], res->rpd, textureID, params.passthroughVert, params.premultiplyFrag, blitMvp,
+               emptyFrag, 0);
+      textureID = res->tex[0];
+      fbo_switcher = true;
+    }
+  } else if (c->media()->get_type() == MEDIA_TYPE_SEQUENCE) {
+    Sequence* nested_seq = c->media()->to_sequence().get();
+    bool circular = (nested_seq == params.seq);
+    if (!circular) {
       for (auto* nest : params.nests) {
         if (nest->media() != nullptr && nest->media()->to_sequence().get() == nested_seq) {
           circular = true;
           break;
         }
       }
-      if (nested_seq == params.seq) circular = true;
-
-      if (!circular) {
-        params.nests.append(c);
-        auto saved_gizmos = params.gizmos;
-        textureID = amber::rendering::compose_sequence(params);
-        params.gizmos = saved_gizmos;
-        params.nests.removeLast();
-        fbo_switcher = true;
-      }
-    } else if (c->media()->get_type() == MEDIA_TYPE_FOOTAGE) {
-      if (textureID != nullptr && !c->media()->to_footage()->alpha_is_premultiplied) {
-        QMatrix4x4 blitMvp;
-        blitMvp.ortho(-1, 1, -1, 1, -1, 1);
-        // Intentional clipSpaceCorrMatrix on this intermediate pass: the extra Y-flip pairs
-        // with the YUV->RGB pass flip (for YUV clips) or the texcoord swap (for RGBA clips)
-        // to keep the total flip count even. See also rhi_blit_srcover.
-        QByteArray emptyFrag;  // premultiply.frag has no UBO (only sampler)
-        rhi_blit(params, res->rt[0], res->rpd, textureID, params.passthroughVert, params.premultiplyFrag, blitMvp,
-                 emptyFrag, 0);
-        textureID = res->tex[0];
-        fbo_switcher = true;
-      }
+    }
+    if (!circular) {
+      params.nests.append(c);
+      auto saved_gizmos = params.gizmos;
+      textureID = amber::rendering::compose_sequence(params);
+      params.gizmos = saved_gizmos;
+      params.nests.removeLast();
+      fbo_switcher = true;
     }
   }
+  return textureID;
+}
 
-  // set up default coordinates
-  GLTextureCoords coords;
-  coords.grid_size = 1;
-  coords.vertexTopLeftX = coords.vertexBottomLeftX = -video_width / 2;
-  coords.vertexTopLeftY = coords.vertexTopRightY = -video_height / 2;
-  coords.vertexTopRightX = coords.vertexBottomRightX = video_width / 2;
-  coords.vertexBottomLeftY = coords.vertexBottomRightY = video_height / 2;
-  coords.vertexBottomLeftZ = coords.vertexBottomRightZ = coords.vertexTopLeftZ = coords.vertexTopRightZ = 1;
-  coords.textureTopLeftY = coords.textureTopRightY = coords.textureTopLeftX = coords.textureBottomLeftX = 0.0;
-  coords.textureBottomLeftY = coords.textureBottomRightY = coords.textureTopRightX = coords.textureBottomRightX = 1.0;
-  coords.textureTopLeftQ = coords.textureTopRightQ = coords.textureBottomRightQ = coords.textureBottomLeftQ = 1;
-  coords.blendmode = -1;
-  coords.opacity = 1.0;
-
-  double timecode = get_timecode(c, playhead);
-
-  // Apply clip effects
+// Apply all effects and transitions to a clip's texture.
+static void apply_clip_effects(Clip* c, long playhead, double timecode, GLTextureCoords& coords,
+                               QRhiTexture*& textureID, bool& fbo_switcher, ComposeSequenceParams& params) {
   for (int j = 0; j < c->effects.size(); j++) {
     Effect* e = c->effects.at(j).get();
     process_effect(c, e, timecode, coords, textureID, fbo_switcher, params.texture_failed, kTransitionNone, params);
   }
 
-  // Apply opening transition
   if (c->opening_transition != nullptr) {
     int transition_progress = playhead - c->timeline_in(true);
     if (transition_progress < c->opening_transition->get_length()) {
@@ -750,7 +679,6 @@ static void composite_video_clip(Clip* c, long playhead, Sequence* s, ComposeSeq
     }
   }
 
-  // Apply closing transition
   if (c->closing_transition != nullptr) {
     int transition_progress = playhead - (c->timeline_out(true) - c->closing_transition->get_length());
     if (transition_progress >= 0 && transition_progress < c->closing_transition->get_length()) {
@@ -759,30 +687,17 @@ static void composite_video_clip(Clip* c, long playhead, Sequence* s, ComposeSeq
                      fbo_switcher, params.texture_failed, kTransitionClosing, params);
     }
   }
+}
 
-  // Build per-clip MVP
-  QMatrix4x4 clip_mvp = sequence_ortho;
-  clip_mvp *= coords.transform;
-  if (c->autoscaled() && (video_width != s->width || video_height != s->height)) {
-    float width_multiplier = float(s->width) / float(video_width);
-    float height_multiplier = float(s->height) / float(video_height);
-    float scale_multiplier = qMin(width_multiplier, height_multiplier);
-    clip_mvp.scale(scale_multiplier, scale_multiplier, 1);
-  }
-
-  if (params.gizmos != nullptr && params.gizmos->parent_clip == c) {
-    params.gizmos->gizmo_draw(timecode, coords);
-    params.gizmos->gizmo_world_to_screen(clip_mvp);
-    gizmos_drawn = true;
-  }
-
-  if (textureID == nullptr) return;
-
-  // Determine backend targets for this clip
+// Apply Y-flip compensation for RGBA clips and then render+blend to final target.
+static void render_and_blend_clip(Clip* c, ComposeSequenceParams& params, QRhiTexture* textureID,
+                                  GLTextureCoords& coords, const QMatrix4x4& clip_mvp,
+                                  QRhiTextureRenderTarget* final_target) {
+  // Resolve back-buffer targets
   QRhiTextureRenderTarget* back_target1;
   QRhiTexture* back_tex1;
   QRhiRenderPassDescriptor* back_rpd;
-  if (params.nests.size() > 0 && params.nests.last()->fbo_rhi != nullptr) {
+  if (!params.nests.isEmpty() && params.nests.last()->fbo_rhi != nullptr) {
     ClipRhiResources* nestRes = static_cast<ClipRhiResources*>(params.nests.last()->fbo_rhi);
     // Explicitly clear the nested back-buffer before drawing this inner clip.
     // nestRes->rt[1] is PreserveColorContents (needed for the effect ping-pong path on
@@ -803,27 +718,83 @@ static void composite_video_clip(Clip* c, long playhead, Sequence* s, ComposeSeq
     back_rpd = params.backend_rpd;
   }
 
-  // The RGBA path has one fewer render pass than YUV (no YUV->RGB shader pass).
-  // On non-OpenGL backends, each offscreen pass flips the image (either via
-  // clipSpaceCorrMatrix on Vulkan, or inherent framebuffer convention on Metal/D3D).
-  // The missing pass leaves the RGBA path with an odd flip count — compensate here.
-  // isYUpInFramebuffer() is true only on OpenGL where no compensation is needed.
+  // RGBA path flip compensation (see comment in original)
   if (!params.rhi->isYUpInFramebuffer() && c->rgba_tex != nullptr && c->cached_rhi_tex == c->rgba_tex) {
     std::swap(coords.textureTopLeftY, coords.textureBottomLeftY);
     std::swap(coords.textureTopRightY, coords.textureBottomRightY);
   }
 
-  // Render clip into back buffer with clip_mvp transform
   render_clip_to_backbuffer(params, textureID, coords, clip_mvp, back_target1, back_rpd);
 
-  // Composite foreground (clip in back_tex1) onto main target using SrcOver blending.
-  // The main target has PreserveColorContents, so existing content is the background.
-  // For non-normal blend modes, we'd need the blending shader (TODO).
   if (!amber::CurrentRuntimeConfig.disable_blending) {
     rhi_blit_srcover(params, final_target, params.main_rpd, back_tex1, coords.opacity);
   } else {
     rhi_blit_passthrough(params, final_target, params.main_rpd, back_tex1, coords.opacity);
   }
+}
+
+// Composite a single video clip: retrieve texture, apply effects/transitions, render to back buffer,
+// then blend onto the final compositing target. Sets gizmos_drawn if this clip's gizmos were processed.
+static void composite_video_clip(Clip* c, long playhead, Sequence* s, ComposeSequenceParams& params,
+                                 const QMatrix4x4& sequence_ortho, QRhiTextureRenderTarget* final_target,
+                                 bool& gizmos_drawn) {
+  if (!c) {
+    qWarning() << "composite_video_clip: c is null";
+    return;
+  }
+  if (!s) {
+    qWarning() << "composite_video_clip: s is null";
+    return;
+  }
+  if (!final_target) {
+    qWarning() << "composite_video_clip: final_target is null";
+    return;
+  }
+  if (playhead < c->timeline_in(true) || playhead >= c->timeline_out(true)) return;
+
+  int video_width = c->media_width();
+  int video_height = c->media_height();
+
+  QSize comp_size = params.main_tex->pixelSize();
+  ensure_clip_fbo(c, params.rhi, comp_size);
+
+  bool fbo_switcher = false;
+  QRhiTexture* textureID = prepare_clip_texture(c, playhead, fbo_switcher, params);
+
+  // Set up default texture coordinates
+  GLTextureCoords coords;
+  coords.grid_size = 1;
+  coords.vertexTopLeftX = coords.vertexBottomLeftX = -video_width / 2;
+  coords.vertexTopLeftY = coords.vertexTopRightY = -video_height / 2;
+  coords.vertexTopRightX = coords.vertexBottomRightX = video_width / 2;
+  coords.vertexBottomLeftY = coords.vertexBottomRightY = video_height / 2;
+  coords.vertexBottomLeftZ = coords.vertexBottomRightZ = coords.vertexTopLeftZ = coords.vertexTopRightZ = 1;
+  coords.textureTopLeftY = coords.textureTopRightY = coords.textureTopLeftX = coords.textureBottomLeftX = 0.0;
+  coords.textureBottomLeftY = coords.textureBottomRightY = coords.textureTopRightX = coords.textureBottomRightX = 1.0;
+  coords.textureTopLeftQ = coords.textureTopRightQ = coords.textureBottomRightQ = coords.textureBottomLeftQ = 1;
+  coords.blendmode = -1;
+  coords.opacity = 1.0;
+
+  double timecode = get_timecode(c, playhead);
+  apply_clip_effects(c, playhead, timecode, coords, textureID, fbo_switcher, params);
+
+  // Build per-clip MVP
+  QMatrix4x4 clip_mvp = sequence_ortho;
+  clip_mvp *= coords.transform;
+  if (c->autoscaled() && (video_width != s->width || video_height != s->height)) {
+    float scale_multiplier = qMin(float(s->width) / float(video_width), float(s->height) / float(video_height));
+    clip_mvp.scale(scale_multiplier, scale_multiplier, 1);
+  }
+
+  if (params.gizmos != nullptr && params.gizmos->parent_clip == c) {
+    params.gizmos->gizmo_draw(timecode, coords);
+    params.gizmos->gizmo_world_to_screen(clip_mvp);
+    gizmos_drawn = true;
+  }
+
+  if (textureID == nullptr) return;
+
+  render_and_blend_clip(c, params, textureID, coords, clip_mvp, final_target);
 }
 
 // Process a single audio clip: handle nested sequences or cache audio data.
@@ -861,8 +832,33 @@ static void process_audio_clip(Clip* c, long playhead, ComposeSequenceParams& pa
 
     if (got_mutex2) {
       c->cache_lock.unlock();
-      c->Cache(playhead, (params.viewer != nullptr && !params.viewer->playing), params.nests, params.playback_speed);
+      c->Cache(playhead, params.scrubbing, params.nests, params.playback_speed);
     }
+  }
+}
+
+// Resolve nested sequence: walk the nesting stack to compute the effective sequence and playhead,
+// and redirect the compositing target to the nest's FBO if video mode.
+static void resolve_nested_sequence(ComposeSequenceParams& params, Sequence*& s, long& playhead,
+                                    QRhiTextureRenderTarget*& final_target, QRhiTexture*& final_tex) {
+  for (auto nest : params.nests) {
+    if (nest->media() == nullptr) continue;
+    s = nest->media()->to_sequence().get();
+    if (s == nullptr) continue;
+    playhead += nest->clip_in(true) - nest->timeline_in(true);
+    playhead = rescale_frame_number(playhead, nest->sequence->frame_rate, s->frame_rate);
+  }
+  if (params.video && params.nests.last()->fbo_rhi != nullptr) {
+    ClipRhiResources* nestRes = static_cast<ClipRhiResources*>(params.nests.last()->fbo_rhi);
+    QColor clearColor(0, 0, 0, 0);
+    // Clear via the non-preserve alias — a beginPass on rt[0] itself would be a no-op
+    // because rt[0] is PreserveColorContents (LoadOp::Load). Without this, the previous
+    // frame's composite persists and leaks through transparent regions (#24).
+    QRhiTextureRenderTarget* clear_rt = nestRes->rt_clear[0] ? nestRes->rt_clear[0] : nestRes->rt[0];
+    params.cb->beginPass(clear_rt, clearColor, {1.0f, 0});
+    params.cb->endPass();
+    final_target = nestRes->rt[0];
+    final_tex = nestRes->tex[0];
   }
 }
 
@@ -878,27 +874,7 @@ QRhiTexture* amber::rendering::compose_sequence(ComposeSequenceParams& params) {
   long playhead = s->playhead;
 
   if (!params.nests.isEmpty()) {
-    for (auto nest : params.nests) {
-      if (nest->media() == nullptr) continue;
-      s = nest->media()->to_sequence().get();
-      if (s == nullptr) continue;
-      playhead += nest->clip_in(true) - nest->timeline_in(true);
-      playhead = rescale_frame_number(playhead, nest->sequence->frame_rate, s->frame_rate);
-    }
-
-    if (params.video && params.nests.last()->fbo_rhi != nullptr) {
-      ClipRhiResources* nestRes = static_cast<ClipRhiResources*>(params.nests.last()->fbo_rhi);
-      // Clear nest FBO[0] — use the non-preserve alias so beginPass(clearColor) actually
-      // clears. A beginPass on rt[0] itself would be a no-op because rt[0] is
-      // PreserveColorContents (LoadOp::Load). Without this, the previous frame's composite
-      // persists and leaks through transparent regions (#24).
-      QColor clearColor(0, 0, 0, 0);
-      QRhiTextureRenderTarget* clear_rt = nestRes->rt_clear[0] ? nestRes->rt_clear[0] : nestRes->rt[0];
-      params.cb->beginPass(clear_rt, clearColor, {1.0f, 0});
-      params.cb->endPass();
-      final_target = nestRes->rt[0];
-      final_tex = nestRes->tex[0];
-    }
+    resolve_nested_sequence(params, s, playhead, final_target, final_tex);
   }
 
   int audio_track_count = 0;
@@ -957,13 +933,12 @@ QRhiTexture* amber::rendering::compose_sequence(ComposeSequenceParams& params) {
   return nullptr;
 }
 
-void amber::rendering::compose_audio(Viewer* viewer, Sequence* seq, int playback_speed, bool wait_for_mutexes) {
+void amber::rendering::compose_audio(Sequence* seq, bool scrubbing, int playback_speed, bool wait_for_mutexes) {
   if (!seq) {
     qWarning() << "compose_audio: seq is null";
     return;
   }
   ComposeSequenceParams params;
-  params.viewer = viewer;
   params.rhi = nullptr;
   params.cb = nullptr;
   params.seq = seq;
@@ -971,7 +946,7 @@ void amber::rendering::compose_audio(Viewer* viewer, Sequence* seq, int playback
   params.gizmos = nullptr;
   params.wait_for_mutexes = wait_for_mutexes;
   params.playback_speed = playback_speed;
-  params.scrubbing = (viewer != nullptr && !viewer->playing);
+  params.scrubbing = scrubbing;
   compose_sequence(params);
 }
 
