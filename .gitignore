@@ -5,6 +5,10 @@ effects/frei0r
 ts/*.qm
 docs
 
+# aqtinstall Python virtualenv for provisioning Qt locally
+# (used by packaging/linux/appimage.dockerfile and dev workflows)
+.aqt/
+
 #
 # Qt ignores taken from https://github.com/github/gitignore
 #

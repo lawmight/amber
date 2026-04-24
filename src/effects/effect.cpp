@@ -358,6 +358,18 @@ static EffectField* ParseStringDefaultField(EffectRow* row, const QString& id, c
   return f;
 }
 
+static EffectField* ParseFontField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs) {
+  EffectField* f = new FontField(row, id);
+  for (const auto& attr : attrs) {
+    if (attr.name() == QLatin1String("default")) {
+      f->SetValueAt(0, attr.value().toString());
+      f->SetDefaultData(attr.value().toString());
+      break;
+    }
+  }
+  return f;
+}
+
 static EffectField* ParseBoolField(EffectRow* row, const QString& id, const QXmlStreamAttributes& attrs) {
   EffectField* f = new BoolField(row, id);
   for (const auto& attr : attrs) {
@@ -433,7 +445,7 @@ void Effect::parseFieldElement(QXmlStreamReader& reader, EffectRow* row) {
       ParseComboField(row, id, attributes, reader);
       break;
     case EffectField::EFFECT_FIELD_FONT:
-      ParseStringDefaultField(row, id, attributes, "default", false);
+      ParseFontField(row, id, attributes);
       break;
     case EffectField::EFFECT_FIELD_FILE:
       ParseStringDefaultField(row, id, attributes, "filename", true);

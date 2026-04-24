@@ -31,6 +31,7 @@
 #include "ui/labelslider.h"
 #include "ui/keyframenavigator.h"
 #include "effects/effectrow.h"
+#include "effects/ui/effectfieldwidget.h"
 
 class GraphEditor : public Panel {
   Q_OBJECT
@@ -53,6 +54,7 @@ private:
   TimelineHeader* header;
   QHBoxLayout* value_layout;
   QVector<LabelSlider*> field_sliders_;
+  QVector<EffectFieldWidget*> field_widgets_;
   QVector<QPushButton*> field_enable_buttons;
   QLabel* current_row_desc;
   EffectRow* row{nullptr};
