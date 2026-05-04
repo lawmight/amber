@@ -7,6 +7,12 @@ mode that exposes deterministic editing tools to an external Cursor SDK agent ov
 stdio JSON-RPC 2.0 / MCP framing. It does not propose embedding an agent inside
 Amber and does not implement automation code.
 
+This revision incorporates the full Amber 2.0.lawmight agent context supplied after
+the initial assessment. The local `/opt/data/home/amber-agent-context.md` file and
+`/opt/data/home/amber-research-results/` directory were not present in this
+environment, so the pasted full context is treated as the exact plan input for this
+revision.
+
 The plan is feasible, but only if the automation layer is treated as a thin transport
 and dispatch boundary. Stdio parsing and response writing can run on a dedicated
 automation thread, but every read or write of project/editor state must execute on
@@ -18,6 +24,179 @@ The unsafe path is equally clear: direct writes to `Sequence::clips`, `Clip` tim
 fields, `EffectField` data, `Cacher`, or QRhi-owned resources from the automation
 thread would bypass undo, race with renderer/cacher threads, or violate Qt widget and
 timer affinity rules.
+
+After reviewing the complete context, the core feasibility judgment is unchanged,
+but the recommended first implementation should be narrower and more explicitly
+phased than the initial report implied:
+
+- Phase 1 should be read-only MCP plumbing plus inspection tools only.
+- Phase 2 should add a very small undo-preserving mutation set.
+- Preview/export automation should remain a later task-backed phase.
+- The first PR should be an automation skeleton with one or two safe tools, not a
+  broad editor automation surface.
+
+## What changed after seeing the full plan
+
+### Confirmed by the full context
+
+The full plan strongly confirms these repo-grounded findings:
+
+- **External Cursor SDK process first.** Amber should expose deterministic local
+  tools; the agent brain should run outside Amber. This matches the repo reality:
+  the safe seams are Qt/C++ command handlers, not embedded scripting or model code.
+- **Stdio MCP first.** The no-port/no-auth parent-process trust model is compatible
+  with Amber's desktop app shape and avoids adding HTTP server lifecycle/security
+  concerns to an already thread-sensitive Qt application.
+- **GUI-thread ownership.** The plan's claim that `OliveGlobal`/`AmberGlobal`,
+  `ProjectModel`, `UndoStack`, `amber::ActiveSequence`, clip vector mutations, and
+  panel state belong to the GUI thread is supported by the inspected code.
+- **Undo as mutation contract.** The plan's requirement to route mutations through
+  `ComboAction` + `amber::UndoStack` is exactly what timeline, project, effect, and
+  media paths already do.
+- **No render internals in automation MVP.** The inspected QRhi/render/export code
+  makes this more important, not less.
+
+### Added nuance from repo inspection
+
+The full context says short commands can use `QMetaObject::invokeMethod(...,
+Qt::BlockingQueuedConnection)` from the automation thread into a GUI-thread command
+handler. That can work for fast commands, but the repo inspection adds important
+constraints:
+
+- Blocking calls must never be made from the GUI thread itself; guard against same
+  thread invocation and use direct execution when already on the GUI thread.
+- Blocking calls must not wrap operations that can show modal dialogs, wait on
+  rendering/export, or trigger project load UI.
+- Blocking calls must not hold worker-thread locks while waiting, or shutdown can
+  deadlock.
+- Long operations must use queued async task creation and return `task_id`.
+
+The complete context also broadens the product vision with compound editing tools,
+perception sidecars, OTIO, social-video workflows, and preview critique loops. Those
+are strategically sound, but the code integration assessment still says they should
+sit above a narrow, deterministic, undo-safe primitive layer.
+
+### Corrections to the initial tool ordering
+
+The initial report listed some project operations alongside MVP candidates. With
+the complete plan, the order should be stricter:
+
+1. `initialize`, `tools/list`, `tools/call`, and read-only inspection tools.
+2. Only then `undo`, `redo`, `save_project`, `import_media`, `create_sequence`,
+   `add_clip`, `split_clip`, and `ripple_delete`.
+3. Preview/export and compound operations later.
+
+This reduces risk because it first proves JSON-RPC framing, GUI-thread dispatch,
+stable IDs, and state serialization without exercising undo or render/export
+hazards.
+
+## Full plan comparison
+
+### Strategic architecture
+
+The full plan's architecture is well aligned with the codebase:
+
+- Amber remains the deterministic editing environment.
+- Cursor SDK remains an external orchestrator.
+- The protocol surface is stdio JSON-RPC 2.0 framed as MCP.
+- The launch path is explicit: `amber --automation-stdio`.
+- Optional `--automation-headless` should remain future work.
+
+The one integration caveat is that normal GUI initialization should still occur for
+the first implementation. Current safe operations rely on `MainWindow`, panel
+singletons, `AppContextImpl`, `ProjectModel`, `amber::Global`, and `amber::UndoStack`.
+A headless mode would require a separate app-context and panel-free command service
+design.
+
+### Suggested `src/automation` layout
+
+The proposed layout is reasonable:
+
+- `src/automation/CMakeLists.txt`
+- `automationserver.h/.cpp`
+- `jsonrpc.h/.cpp`
+- `commands.h/.cpp`
+- `serialize.h/.cpp`
+- `mcp_tools.h/.cpp`
+
+Repo integration note: `src/CMakeLists.txt` currently builds `amber-engine` plus a
+large `UI_SOURCES` list for the executable. The lowest-risk first PR is to add
+automation sources to `UI_SOURCES` or add a small automation library linked only by
+`${AMBER_TARGET}`. Do not put UI-panel-dependent automation code into
+`amber-engine` unless tests/stubs are updated, because `amber-engine` is already
+shared with headless tests.
+
+### MCP shape and Nia prior art
+
+The Nia prior-art summary changes the report from "generic JSON-RPC feasibility" to
+"MCP-compatible editor tool surface with known precedents":
+
+- `burningion/video-editing-mcp`
+  - Useful for MCP shape, resource URIs, lazy loading, OTIO-oriented resources, and
+    task/resource polling.
+  - Amber should borrow the protocol/resource discipline, not its implementation
+    details.
+- `samuelgursky/davinci-resolve-mcp`
+  - Useful as a mature NLE MCP surface with both granular and compound operations.
+  - Amber should first expose granular undo-safe commands, then layer compound
+    tools externally.
+- OpenTimelineIO
+  - Useful canonical IR and vocabulary: overwrite, insert, trim, slice, slip,
+    slide, ripple, roll, fill, remove.
+  - Amber should not make OTIO import/export part of the first PR, but its JSON
+    timeline DTOs should avoid names that conflict with OTIO concepts.
+- OpenShot `UpdateAction`
+  - Useful precedent for command-bus records carrying `type`, `key`, `values`,
+    `old_values`, and `transaction`.
+  - Amber already has stronger native undo objects; an automation audit log could
+    mimic this shape later.
+- Kdenlive Python sidecars
+  - Supports the plan's "no embedded scripting first" decision. Perception and AI
+    helpers can live outside Amber.
+- MLT
+  - Demonstrates robust headless engine automation, but Amber's current app is not
+    factored as a headless engine. Treat headless as later architecture work.
+- MoviePy
+  - Good inspiration for a future high-level SDK, not a replacement for Amber's
+    native undoable editor operations.
+- CapCut/Jianying draft APIs
+  - Useful for social-video workflow vocabulary, but too fragile for a core local
+    automation contract.
+
+### Agentic editor loop
+
+The loop in the full context is feasible above the MCP layer:
+
+1. ingest media,
+2. run perception sidecars,
+3. build timeline JSON,
+4. agent plans edit,
+5. agent calls Amber tools,
+6. Amber mutates timeline and renders preview frame/segment,
+7. vision/perception critiques output,
+8. agent iterates through undo/redo or snapshots,
+9. final export.
+
+Repo-grounded implication: Amber should provide stable, deterministic primitives and
+preview/export task hooks. It should not own Whisper, diarization, CLIP embeddings,
+OCR, face/object detection, or caption critique in the first implementation.
+
+### Timeline JSON expectations
+
+The requested timeline JSON shape is reasonable and should include:
+
+- project metadata,
+- sequences,
+- tracks,
+- clips with timeline in/out, source media, source range, track, linked IDs,
+- effects and keyframes,
+- markers/subtitles,
+- media bin,
+- render/export settings.
+
+Implementation warning: external IDs must be per-session stable IDs, not raw
+pointers and not bare `QVector` indices without validation. Sequence/clip/effect
+indices can change after undo, delete, import, split, ripple, or project reload.
 
 ## Files and symbols verified
 
@@ -635,17 +814,164 @@ The export path should mirror `ExportDialog::launch_export_thread(...)`:
 Do not call `ExportThread` methods that touch state from the stdio worker, except
 through queued task-registry methods.
 
+## Implementation phases from the full plan
+
+The full context's phased plan is the right sequencing. Repo inspection adds the
+following integration notes and gates for each phase.
+
+### Phase 0: prepare branch and avoid render internals
+
+Confirmed. This work should remain on `2.0.lawmight` / derivative feature branches
+and avoid broad render, cache, and QRhi refactors. The branch already contains
+threading-sensitive RHI/export fixes, so speculative cleanup in these areas would
+raise review risk without helping the automation skeleton.
+
+Phase 0 gate:
+
+- no behavior changes outside explicitly requested automation scaffolding,
+- normal launch remains unchanged,
+- no direct changes to `RenderThread`, `ExportThread`, `Cacher`, or clip QRhi fields
+  unless a later preview/export phase specifically requires a service wrapper.
+
+### Phase 1: read-only automation
+
+This should be the first implementation PR. It should add:
+
+- `--automation-stdio` flag,
+- JSON-RPC/MCP initialize path,
+- `tools/list`,
+- `tools/call`,
+- at least four read-only tools from the plan:
+  - `inspect_project`,
+  - `list_media`,
+  - `list_sequences`,
+  - `inspect_timeline` or `get_active_sequence`.
+
+Repo-grounded constraints:
+
+- Even read-only tools must execute serialization on the GUI thread.
+- Serialization should return value DTOs only; no pointers or mutable references.
+- Normal launch without the flag must be byte-for-byte behaviorally equivalent from a
+  user perspective.
+- Avoid loading/saving project files or touching undo in Phase 1.
+
+### Phase 2: safe mutations
+
+Phase 2 should add only a small mutation set after Phase 1 proves dispatch and IDs:
+
+- `undo`,
+- `redo`,
+- `save_project` or explicit `save_project_as`,
+- `import_media` with guarded local file paths,
+- `create_sequence`,
+- one or two timeline mutations such as `add_clip`, `split_clip`, or
+  `ripple_delete`.
+
+Repo-grounded constraints:
+
+- Every mutation must run on GUI thread.
+- Every project mutation must push `ComboAction` / `AmberAction` commands to
+  `amber::UndoStack` or call an existing UI/app operation with equivalent undo
+  behavior.
+- Validate all IDs and frame ranges before constructing commands with side effects.
+- Do not hand-write `.ove` XML; use project save/import paths.
+- Reject operations that would open modal confirmation dialogs unless the tool has an
+  explicit non-interactive policy.
+
+### Phase 3: preview frame rendering
+
+`render_preview_frame` should remain deferred until command dispatch and mutation
+undo are proven. It should not expose `RenderThread` internals directly. A safe
+preview phase needs a GUI-thread task facade that:
+
+- pauses or snapshots the relevant viewer/render state deliberately,
+- starts rendering through existing render surfaces or a narrowly designed preview
+  service,
+- returns a file path plus frame/timecode metadata,
+- cleans up through existing QRhi ownership paths.
+
+Because `Clip::Retrieve(...)` and QRhi resource lifetimes are tightly tied to
+`RenderThread::paint()`, preview work should be reviewed as a rendering integration,
+not a generic automation command.
+
+### Phase 4: external Cursor SDK runner
+
+This should remain outside Amber. Amber should know about MCP/JSON-RPC tool calls,
+not Cursor SDK internals. The external runner can orchestrate:
+
+- perception sidecars,
+- planning,
+- tool calls,
+- preview critique,
+- undo/redo iteration,
+- final export.
+
+Amber's responsibility is deterministic, local, undo-preserving tool execution.
+
+### Phase 5: compound tools and interchange
+
+Compound tools from the full context should be implemented after primitives are
+stable:
+
+- `create_rough_cut_from_transcript`,
+- `make_short_variant`,
+- `remove_silence`,
+- `add_caption_style`,
+- `apply_reference_style`,
+- `generate_preview_pack`,
+- OTIO import/export,
+- sidecar Python helpers,
+- preview segments,
+- branch/snapshot support.
+
+These should mostly live in the external agent or a thin composition layer. Amber
+should expose primitives and, selectively, local deterministic compound operations
+where undo grouping is clear.
+
 ## Acceptance realism
+
+### First Cursor-agent implementation acceptance criteria
+
+The full context's acceptance criteria are realistic if scoped to Phase 1 plus a
+small Phase 2 slice. The first implementation should be accepted only if it proves:
+
+- Amber compiles on `2.0.lawmight`.
+- Normal launch is unchanged when `--automation-stdio` is absent.
+- Automation is behind the explicit `--automation-stdio` flag.
+- MCP/JSON-RPC plumbing supports initialize, `tools/list`, and `tools/call`.
+- At least four read-only tools work end-to-end.
+- At least two mutation tools work end-to-end.
+- Every mutation preserves undo/redo through `amber::UndoStack`.
+- No mutation directly writes existing `Clip` fields or `Sequence::clips`.
+- No automation code touches `Cacher`, `RenderThread` internals, or QRhi texture
+  ownership.
+- A short README or developer note explains launch, protocol framing, tools, and
+  safety rules.
+- A smoke test/script calls `inspect_project` and one mutation, then verifies undo.
+
+Repo inspection adds two extra acceptance checks:
+
+- Read-only inspection must also prove GUI-thread dispatch.
+- Mutations should fail with structured JSON-RPC errors when project state is
+  missing or IDs are stale, rather than crashing or opening modal UI.
 
 ### Realistic for MVP
 
-An MVP is realistic if it is scoped to deterministic project inspection and
+An MVP is realistic if it is scoped to deterministic project inspection first, then
 undoable timeline/effect mutations that already have command objects. The highest
-confidence tools are:
+confidence read-only tools are:
 
 - inspect project/sequences/clips/effects,
+- list media,
+- active sequence and timeline state,
+- effect/field/keyframe summaries.
+
+The highest confidence mutation tools after read-only plumbing are:
+
 - save/open with explicit non-interactive policy,
 - import media with guarded file types,
+- create sequence,
+- add clip using existing media and undo commands,
 - split/move/delete/ripple ranges,
 - set work area,
 - add/delete/reorder/enable effects,
@@ -681,6 +1007,30 @@ The following should be rejected in code review:
   `Clip::fbo_rhi`,
 - synchronous JSON-RPC export calls that block until completion,
 - automation commands that rely on current mouse hover, focus, or modal dialogs.
+
+## Notes for future agents
+
+The full context's future-agent guidance should be treated as code-review policy:
+
+- Do not solve everything in one PR.
+- The first PR should be a narrow automation skeleton with one or two safe tools.
+- Avoid speculative refactors.
+- Preserve Amber's lightweight, thread-sensitive architecture.
+- Prefer small adapters over rewrites.
+- Keep the Cursor SDK external.
+- Do not require Amber to understand Cursor internals.
+- Read the Nia reports before coding if they are available locally:
+  - `oracle_automation_api_architecture.md`,
+  - `oracle_agentic_video_editor_loop.md`,
+  - `oracle_amber_code_integration_map.md`,
+  - `tracer_existing_video_editor_automation_projects.md`,
+  - `tracer_capcut_jianying_draft_api_mcp_projects.md`,
+  - `tracer_open_source_nle_architectures.md`,
+  - `summary_for_tom.txt`.
+
+If those files are not available in a future agent environment, use the summarized
+prior art in this report and the pasted agent context as the fallback source of
+truth.
 
 ## Recommended test plan
 
