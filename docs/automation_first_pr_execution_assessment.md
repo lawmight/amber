@@ -1,33 +1,166 @@
 # Amber 2.0.lawmight automation first-PR execution assessment
 
+## Revision note: what changed after the full context
+
+This assessment was revised after receiving the full Amber agent context pasted in the task. The local
+files referenced by that context were **not available** in this cloud environment:
+
+- `/opt/data/home/amber-agent-context.md`
+- `/opt/data/home/amber-research-results/`
+
+The pasted context is therefore treated as the source of truth for this revision, including the summarized
+Nia research outputs, prior art, phases, acceptance criteria, and notes for future agents.
+
+If future agents have access to the local Nia report directory, they should read these files before
+expanding beyond the first PR:
+
+- `oracle_automation_api_architecture.md`
+- `oracle_agentic_video_editor_loop.md`
+- `oracle_amber_code_integration_map.md`
+- `tracer_existing_video_editor_automation_projects.md`
+- `tracer_capcut_jianying_draft_api_mcp_projects.md`
+- `tracer_open_source_nle_architectures.md`
+- `summary_for_tom.txt`
+
+Material changes from the first assessment:
+
+1. The first PR must satisfy the stated acceptance criterion of **at least four read-only tools and two
+   mutation tools**. The safest two mutation tools are `undo` and `redo`.
+2. `save_project` should not count as one of the required first two mutation tools unless it is guarded
+   against unsaved projects. It is acceptable as an optional third tool or explicit placeholder.
+3. The full proposed file layout is worth preserving in the first implementation, including
+   `jsonrpc.*`, `mcp_tools.*`, and `src/automation/CMakeLists.txt`, because the context is planning for
+   later external Cursor SDK orchestration and future agents need clear ownership boundaries.
+4. The first PR should still **not** include `import_media`, `create_sequence`, `add_clip`, `split_clip`,
+   `ripple_delete`, or `render_preview_frame`. That recommendation is unchanged, but now framed as the
+   minimum way to meet acceptance criteria while avoiding the repo-specific mutation risks found below.
+5. The smoke script should call `inspect_project` and `undo` (or `redo`) specifically, because that
+   proves one read-only path and one mutation-class tool without requiring media, timelines, or render
+   resources.
+
 ## Executive recommendation
 
-Make the first PR a small, reviewable automation transport and read-only command slice:
+Make the first PR a narrow automation substrate, not a broad editing-tool PR.
 
-1. Add an explicit `--automation-stdio` launch flag.
-2. Start Amber exactly as the normal GUI does, but hide the main window in automation mode.
-3. Implement minimal JSON-RPC/MCP methods: `initialize`, `tools/list`, and `tools/call`.
-4. Expose four read-only tools:
+Recommended first-PR scope:
+
+1. Add explicit `--automation-stdio`.
+2. Preserve normal GUI launch behavior when the flag is absent.
+3. Implement newline-delimited JSON-RPC 2.0 over stdio, shaped as MCP:
+   - `initialize`
+   - `tools/list`
+   - `tools/call`
+4. Expose at least four read-only tools:
    - `inspect_project`
    - `list_media`
    - `list_sequences`
    - `inspect_timeline`
-5. Include two mutation-class tools only if they are thin wrappers around existing global actions:
+5. Expose exactly two safe mutation tools for the first PR:
    - `undo`
    - `redo`
-6. Include `save_project` as either:
-   - a guarded mutation that refuses unsaved projects with a structured error, because
-     `AmberGlobal::save_project()` opens a save dialog when `amber::ActiveProjectFilename` is empty; or
-   - a listed-but-unimplemented placeholder returning `not_implemented`.
+6. Optionally expose `save_project` as a guarded mutation:
+   - refuse if `amber::ActiveProjectFilename` is empty;
+   - otherwise call the existing save path on the GUI thread.
+7. Add short README documentation.
+8. Add one smoke script that starts Amber with `--automation-stdio`, calls `inspect_project`, then calls
+   `undo` or `redo`.
 
-Do **not** include `import_media`, `create_sequence`, `add_clip`, `split_clip`, `ripple_delete`, or
-`render_preview_frame` in the first PR. Those commands are valuable, but they cross UI-panel state,
-undo grouping, media analysis, timeline ghosts, and render-thread behavior. Including them in the
-first PR materially raises compile and review risk.
+Do not include media import, clip creation, timeline edits, preview render, export, sidecars, OTIO, or the
+external Cursor SDK runner in the first PR. Those belong in later phases after the stdio contract and GUI
+thread dispatch are proven.
 
-The first PR should prove the seam: normal launch remains unchanged, `--automation-stdio` is explicit,
-JSON-RPC can drive Amber after startup, read-only state serialization works, and simple existing
-undo/redo/save entry points can be invoked on the GUI thread.
+This PR still advances the strategic architecture from the full context: Amber becomes a deterministic
+local tool host, while Cursor SDK remains an external orchestrator.
+
+## Full-plan comparison
+
+### First-PR acceptance criteria
+
+The full context gives these acceptance criteria:
+
+| Criterion | First-PR plan |
+| --- | --- |
+| Compile on `2.0.lawmight` | Keep code isolated under `src/automation/`, use existing Qt Core JSON, and validate with local CMake build. |
+| Normal launch unchanged | Gate all new behavior behind `--automation-stdio`; preserve `showMaximized()` / `showFullScreen()` path when absent. |
+| Explicit automation flag | Add only `--automation-stdio`; defer `--automation-headless`. |
+| At least four read-only tools | Implement `inspect_project`, `list_media`, `list_sequences`, `inspect_timeline`. |
+| At least two mutation tools | Implement `undo` and `redo` only. |
+| Undo/redo preserved | Route through `AmberGlobal::undo()` / `redo()` and existing `amber::UndoStack`. |
+| No direct `Clip` / `Cacher` / QRhi manipulation | Serialization only reads stable accessors/fields; no render/cacher methods. |
+| README | Add a short automation section to `README.md`. |
+| Smoke script | Add `scripts/smoke_automation_stdio.py` calling `inspect_project` and `undo`. |
+
+The main change after seeing the full context is that `undo` and `redo` move from optional "safe
+mutation-class" tools to required first-PR scope, because they are the lowest-risk way to satisfy the
+two-mutation acceptance criterion.
+
+### Strategic architecture
+
+The full plan says:
+
+- do not embed Cursor SDK in Amber first;
+- add local automation inside Amber;
+- expose tools over stdio JSON-RPC 2.0 framed as MCP;
+- keep mutations on the GUI thread;
+- route mutations through `ComboAction` and `amber::UndoStack`;
+- run Cursor SDK externally.
+
+Repo inspection supports this architecture. Amber already has a Qt GUI-centric ownership model, global
+project/timeline state, and worker threads for rendering/loading/caching. Embedding a model or adding an
+HTTP server first would increase review surface and runtime risk without proving the core editing seam.
+
+### MVP tool list
+
+The full plan's MVP list is intentionally broad:
+
+- read-only: `inspect_project`, `list_sequences`, `list_media`, `get_active_sequence`,
+  `inspect_timeline`, `inspect_clip`, `inspect_effects`;
+- mutations: `import_media`, `create_sequence`, `add_clip`, `move_clip`, `split_clip`,
+  `ripple_delete`, `add_text`, `add_subtitle`, `apply_effect`, `set_effect_param`,
+  `set_keyframe`, `undo`, `redo`, `save_project`;
+- render/export: `render_preview_frame`, `export_sequence`, task APIs.
+
+For the first PR, use only the acceptance-minimum subset:
+
+- read-only: `inspect_project`, `list_media`, `list_sequences`, `inspect_timeline`;
+- mutation: `undo`, `redo`;
+- optional guarded `save_project`.
+
+This is the smallest set that meets the first-PR acceptance criteria while avoiding the timeline, effect,
+media analysis, and QRhi risks identified in the actual code.
+
+### Proposed phases
+
+The full plan phases are sound:
+
+1. Phase 1: read-only automation.
+2. Phase 2: safe mutations.
+3. Phase 3: preview render.
+4. Phase 4: external Cursor SDK runner.
+5. Phase 5: compound tools, OTIO, sidecars, snapshots.
+
+The only adjustment is tactical: because acceptance criteria require two mutation tools in the first PR,
+include `undo` and `redo` with Phase 1. Treat them as "safe Phase 2 slivers" that call existing global
+slots and do not introduce new editing behavior.
+
+### Agentic editor loop
+
+The broader plan is an external loop:
+
+1. ingest media;
+2. run perception sidecars such as `ffprobe`, Whisper, diarization, scene/shot/silence/beat detection,
+   OCR, face/object detection, and CLIP/image embeddings;
+3. build timeline state JSON;
+4. have an external Cursor SDK agent plan edits;
+5. call Amber tools;
+6. render previews;
+7. critique with vision/perception;
+8. iterate with undo/redo/project snapshots;
+9. export final media.
+
+The first PR should only establish steps 3-5 for empty or existing projects. It should not add sidecars,
+preview critique, snapshots, or export. Those need the stdio contract and task/polling model to be stable
+first.
 
 ## Repository facts verified
 
@@ -38,44 +171,41 @@ undo/redo/save entry points can be invoked on the GUI thread.
   (`src/CMakeLists.txt:13-16`).
 - Qt components already include `Qt6::Core`, `Qt6::Gui`, `Qt6::Widgets`, and others
   (`src/CMakeLists.txt:31-44`). `QJsonDocument`, `QJsonObject`, `QJsonArray`, `QFile`,
-  `QSocketNotifier`, and `QMetaObject` are all in Qt Core, so no new third-party dependency is needed.
+  `QSocketNotifier`, and `QMetaObject` are in Qt Core, so no new dependency is needed.
 - Core non-UI code is collected in the `amber-engine` object library (`src/CMakeLists.txt:98-163`).
 - UI/application sources are listed in `UI_SOURCES`, currently including `main.cpp`
   (`src/CMakeLists.txt:181-268`).
 - Executable target is `amber-editor` except on Apple, where it is `Amber`
   (`src/CMakeLists.txt:358-363`).
 - Tests are enabled only when not cross-compiling (`src/CMakeLists.txt:386-390`).
-- Existing shader and export-preset post-build copy steps are attached to the app target
+- Shader/effect and export-preset post-build copies attach to the app target
   (`src/CMakeLists.txt:404-417`).
 
 ### Test setup
 
 - Tests live in `src/tests/` and are registered with CTest in `src/tests/CMakeLists.txt`.
-- Existing test targets link `amber-engine` plus `Qt6::Test`; UI symbols are satisfied by
+- Test targets link `amber-engine` plus `Qt6::Test`; UI symbols are satisfied by
   `src/tests/test_ui_stubs.cpp` (`src/tests/CMakeLists.txt:3-8`).
-- `src/tests/test_projectio.cpp` provides a useful pattern for headless tests with a stub
-  `AppContext` (`src/tests/test_projectio.cpp:10-37`).
-- Because the automation server will need UI types and startup behavior, the most useful first
-  smoke test should be a script that runs the built app, not a Qt unit test linked only to
-  `amber-engine`.
+- `src/tests/test_projectio.cpp` demonstrates a headless `AppContext` stub pattern
+  (`src/tests/test_projectio.cpp:10-37`).
+- Automation startup is app-level, so the first smoke test should be a script that runs the built
+  executable, not a Qt unit test linked only to `amber-engine`.
 
-### CI/release workflows
+### CI and release workflows
 
 - `.github/workflows/build.yml` builds packages on `workflow_dispatch` and release publication.
 - `.github/workflows/preview.yml` only triggers package builds on pushes to `2.0.x` with `[preview]`
   in the commit message (`.github/workflows/preview.yml:3-6`, `:16-27`).
-- The workflows build Docker AppImage/Windows packages and macOS packages. They do not currently
-  run a PR CTest workflow. The first automation PR should therefore be locally validated with the
-  commands in this document and not rely on CI to catch regressions.
+- These workflows build AppImage/Windows/macOS packages. They do not appear to run a PR CTest workflow.
+  The first automation PR needs local build, CTest, and smoke-script evidence.
 
 ### Startup parsing and normal launch
 
 - Startup parsing is custom `argc`/`argv` handling in `src/main.cpp`, not `QCommandLineParser`.
-- `handle_flag()` recognizes current options and rejects unknown flags
-  (`src/main.cpp:88-134`).
+- `handle_flag()` recognizes current options and rejects unknown flags (`src/main.cpp:88-134`).
 - `parse_args()` treats the first non-flag argument as the project filename
   (`src/main.cpp:136-148`).
-- `main()` always:
+- `main()` currently:
   - creates `amber::Global` (`src/main.cpp:252-253`);
   - parses arguments (`src/main.cpp:259-260`);
   - installs the internal logger unless `--no-debug` is used (`src/main.cpp:265`);
@@ -88,16 +218,18 @@ undo/redo/save entry points can be invoked on the GUI thread.
   - optionally schedules project loading (`src/main.cpp:302`);
   - shows the window maximized/fullscreen (`src/main.cpp:304-308`);
   - enters `a.exec()` (`src/main.cpp:310`).
-- `AmberGlobal::finished_initialize()` is the point where startup project loading actually runs
+- `AmberGlobal::finished_initialize()` is where startup project loading and first-launch behavior run
   (`src/global/global.cpp:324-345`).
+
+Automation mode must not break this default launch path. If the automation window is hidden, it must not
+depend on `finished_first_paint`, because that signal will not fire without a first paint.
 
 ### Project, sequence, and timeline seams
 
-- Current project tree is `amber::project_model` (`src/project/projectmodel.h:65-67`), with
-  `childCount()`, `child()`, and `getItem()` available for traversal
-  (`src/project/projectmodel.h:50-58`).
-- `Media` exposes `get_type()`, `get_name()`, `to_footage()`, `to_sequence()`, `childCount()`,
-  and `child()` (`src/project/media.h:45-70`).
+- Project tree is `amber::project_model` (`src/project/projectmodel.h:65-67`), with `childCount()`,
+  `child()`, and `getItem()` for traversal (`src/project/projectmodel.h:50-58`).
+- `Media` exposes `get_type()`, `get_name()`, `to_footage()`, `to_sequence()`, `childCount()`, and
+  `child()` (`src/project/media.h:45-70`).
 - `Sequence` exposes serializable fields directly: `name`, `width`, `height`, `frame_rate`,
   `audio_frequency`, `audio_layout`, `playhead`, `workarea_*`, `markers`, `guides`, and `clips`
   (`src/engine/sequence.h:38-70`).
@@ -105,8 +237,7 @@ undo/redo/save entry points can be invoked on the GUI thread.
   `timeline_in()`, `timeline_out()`, `clip_in()`, `track()`, `enabled()`, `name()`, `speed()`,
   `linked`, and transition pointers (`src/engine/clip.h:81-122`, `:137-141`).
 - `Clip` also owns `Cacher` and QRhi resources (`src/engine/clip.h:144-179`, `:196-197`).
-  First-PR serialization must not touch `Open()`, `Cache()`, `Retrieve()`, `Close()`, `Cacher`,
-  or QRhi fields.
+  Automation serialization must not call cache/render methods or inspect QRhi fields.
 
 ### Undo, redo, save, import, sequence, split, and ripple seams
 
@@ -114,357 +245,294 @@ undo/redo/save entry points can be invoked on the GUI thread.
   `src/engine/undo/undostack.cpp:1-3`).
 - `ComboAction` is the established grouping mechanism for multi-step mutations and owns appended
   `QUndoCommand`s (`src/engine/undo/comboaction.h:19-83`).
-- Global undo/redo slots already route through UI refresh and avoid running while timeline import is
-  active (`src/global/global.cpp:414-428`).
-- `AmberGlobal::save_project()` saves to the current project path or opens the Save As dialog if
-  there is no project filename (`src/global/global.cpp:290-297`). Automation must not call it blindly
-  on an unsaved project.
-- Import flow exists at `AppContext::processFileList()` (`src/core/appcontext.h:35`) and concrete
-  `AppContextImpl::processFileList()` forwards to `Project::process_file_list()`
+- `AmberGlobal::undo()` and `AmberGlobal::redo()` already route through UI refresh and avoid running
+  while timeline import is active (`src/global/global.cpp:414-428`).
+- `AmberGlobal::save_project()` saves to the current path or opens a Save As dialog if no filename is
+  set (`src/global/global.cpp:290-297`). Automation must guard this.
+- Import flow exists through `AppContext::processFileList()` (`src/core/appcontext.h:35`) and
+  `AppContextImpl::processFileList()` forwarding to `Project::process_file_list()`
   (`src/ui/appcontextimpl.cpp:96-100`).
-- `Project::process_file_list()` creates a `ComboAction("Import Media")`, appends media to the project,
-  pushes the action in `finalize_import()`, and starts `PreviewGenerator::AnalyzeMedia()` for imported
-  items (`src/panels/project.cpp:827-887`, `:820-824`).
-- `Project::process_file_list()` can prompt when importing `.ove` files (`src/panels/project.cpp:856-863`),
-  so an automation import command must initially reject `.ove` inputs or add a non-interactive policy.
+- `Project::process_file_list()` creates a `ComboAction("Import Media")`, appends media, pushes the
+  action in `finalize_import()`, and starts `PreviewGenerator::AnalyzeMedia()` for imported items
+  (`src/panels/project.cpp:827-887`, `:820-824`).
+- `Project::process_file_list()` can prompt for `.ove` imports (`src/panels/project.cpp:856-863`).
 - Sequence creation entry points exist:
   - `create_sequence_from_media()` (`src/panels/project.cpp:240-300`);
   - `Project::create_sequence_internal()` (`src/panels/project.h:62`);
-  - `NewSequenceDialog` currently pushes a `ComboAction("Create Sequence")`
+  - `NewSequenceDialog` pushes `ComboAction("Create Sequence")`
     (`src/dialogs/newsequencedialog.cpp:97-113`).
 - Add-clip via timeline ghost import exists:
   - `Timeline::create_ghosts_from_media()` (`src/panels/timeline.h:131`);
   - `Timeline::add_clips_from_ghosts()` (`src/panels/timeline.h:132`,
     implementation `src/panels/timeline.cpp:288-353`).
-  This path depends on `panel_sequence_viewer` for optional seek (`src/panels/timeline.cpp:347-349`).
+  This path can depend on `panel_sequence_viewer` for optional seek (`src/panels/timeline.cpp:347-349`).
 - Split is implemented through `Timeline::split_clip()`, `Timeline::split_clip_and_relink()`, and
   related helpers (`src/panels/timeline.h:116-121`, `src/panels/timeline_splitting.cpp:74-188`).
 - Ripple delete is selection-driven through `Timeline::delete_selection()` and `Timeline::ripple_delete()`
   (`src/panels/timeline.cpp:732-751`, `:1045-1055`).
 
+These seams support later Phase 2 tools, but they are not small enough for the first PR.
+
 ### Render preview seam
 
-- `RenderThread::start_render()` already accepts a save path and supports frame save failure signaling
+- `RenderThread::start_render()` accepts a save path and has frame-save failure signaling
   (`src/rendering/renderthread.h:61-76`).
 - `RenderThread` is `QThread`-based and owns QRhi/offscreen state (`src/rendering/renderthread.h:35-141`).
-  A first PR should not introduce a preview-frame tool because reliable timeout, cancellation, backend,
-  and headless behavior need dedicated testing.
 
-## Smallest high-confidence first PR
+This supports Phase 3, but preview rendering needs dedicated timeout/cancel/backend tests and should not
+be in the first PR.
 
-### Scope
+## Nia/prior-art implications for Amber
 
-Implement:
+The full context summarized several Nia reports and tracer findings. Applied to this repo:
 
-- `--automation-stdio`
-- JSON-RPC framing over newline-delimited JSON on stdin/stdout
-- MCP-compatible:
-  - `initialize`
-  - `tools/list`
-  - `tools/call`
-- Read-only tools:
-  - `inspect_project`
-  - `list_media`
-  - `list_sequences`
-  - `inspect_timeline`
-- Mutation-class tools:
-  - `undo`
-  - `redo`
-- Optional guarded `save_project`:
-  - returns an error if `amber::ActiveProjectFilename` is empty;
-  - otherwise invokes `amber::Global->save_project()` on the GUI thread.
-- README documentation for automation mode.
-- A smoke script that starts the app in `--automation-stdio` mode, calls `initialize`,
-  `tools/call inspect_project`, and one mutation-class tool (`undo` is safest on a clean project).
+- `burningion/video-editing-mcp`: reinforces using MCP-shaped tool definitions, resource URIs, lazy
+  loading, and polling. For Amber first PR, copy the MCP shape but not OTIO/resource complexity yet.
+- `samuelgursky/davinci-resolve-mcp`: validates a granular NLE automation surface plus later compound
+  tools. For Amber first PR, start granular and deterministic.
+- OpenTimelineIO: provides a future canonical IR vocabulary: overwrite, insert, trim, slice, slip,
+  slide, ripple, roll, fill, remove. Do not introduce OTIO in PR 1; keep serializer fields compatible
+  with later OTIO mapping.
+- OpenShot `UpdateAction`: supports JSON command-bus thinking with old/new values and transactions.
+  Amber already has `ComboAction`/`QUndoCommand`; do not duplicate a command bus in PR 1.
+- Kdenlive: suggests Python sidecars are a good place for AI/perception integrations. Keep sidecars
+  outside Amber until the core tool host exists.
+- MLT: shows value in a headless engine contract. Amber is not architected as a headless engine today,
+  so stdio automation should still initialize the Qt app and GUI-owned state.
+- MoviePy: points toward a future fluent SDK layer outside Amber. Do not shape C++ internals around it now.
+- CapCut/Jianying draft APIs: useful for social-video workflow schemas, but fragile; avoid copying their
+  unofficial API assumptions into Amber core.
 
-### Defer
+Net effect: the prior art strengthens the external-agent/local-tool split and the phased plan. It does
+not justify adding more first-PR features.
 
-Defer these to follow-up PRs:
+## Agentic editor loop fit
 
-- `import_media`
-- `create_sequence`
-- `add_clip`
-- `split_clip`
-- `ripple_delete`
-- `render_preview_frame`
-- external Cursor SDK runner
+The full context describes the target loop:
 
-Rationale: the first PR should validate process lifetime, startup readiness, JSON protocol, thread
-handoff, and serialization. Timeline/media mutations should land once the automation harness is
-trusted and a regression script can prove undo/redo around real project state.
+1. external agent ingests media and sidecar perception results;
+2. agent reads Amber timeline/project state as JSON;
+3. agent plans edits;
+4. agent calls Amber tools;
+5. Amber mutates through existing undoable edit paths;
+6. Amber renders preview frames/segments;
+7. external vision/perception critiques the result;
+8. agent iterates with undo/redo/snapshots;
+9. final export runs through Amber.
 
-## Exact file changes for the first PR
+PR 1 only covers steps 2, part of 4, and undo/redo for step 8. That is intentional. It creates the
+stable process/protocol/threading seam that every later step depends on, without taking on sidecar,
+render, export, or compound editing complexity.
 
-### Add automation source files
+## Exact first-PR file plan
 
-Use a small set of files rather than the full proposed layout:
+Use the full context's proposed layout, but keep each file small:
 
+- `src/automation/CMakeLists.txt`
 - `src/automation/automationserver.h`
 - `src/automation/automationserver.cpp`
+- `src/automation/jsonrpc.h`
+- `src/automation/jsonrpc.cpp`
 - `src/automation/commands.h`
 - `src/automation/commands.cpp`
 - `src/automation/serialize.h`
 - `src/automation/serialize.cpp`
+- `src/automation/mcp_tools.h`
+- `src/automation/mcp_tools.cpp`
 
-Do not add a separate `jsonrpc.*` or `mcp_tools.*` in the first PR unless the implementation becomes
-hard to read. A single server class plus command/serialization helpers is easier to review.
-
-Suggested responsibilities:
+Responsibilities:
 
 - `AutomationServer`
-  - Owns stdin notifier or reader thread.
-  - Writes JSON responses to stdout.
-  - Implements JSON-RPC dispatch and method validation.
-  - Emits a signal or uses `QMetaObject::invokeMethod()` to execute tool calls on the GUI thread.
+  - owns stdio reader/writer lifetime;
+  - reads newline-delimited JSON-RPC requests;
+  - writes protocol responses to stdout only;
+  - dispatches fast command handlers onto the GUI thread.
+- `jsonrpc.*`
+  - validates JSON-RPC 2.0 envelopes;
+  - builds `result` and `error` responses;
+  - centralizes error codes (`parse_error`, `invalid_request`, `method_not_found`,
+    `invalid_params`, `not_ready`, `tool_error`).
+- `mcp_tools.*`
+  - implements `initialize`, `tools/list`, and `tools/call` response shapes;
+  - owns first-PR tool metadata and schemas.
 - `commands.*`
-  - Maps tool names to handlers.
-  - Performs input validation and returns `QJsonObject` results/errors.
-  - Calls only stable public seams: `amber::Global->undo()`, `amber::Global->redo()`,
-    guarded `amber::Global->save_project()`, and read-only traversal.
+  - maps tool names to handlers;
+  - validates arguments;
+  - calls only safe read-only serializers and existing global slots for `undo`/`redo`;
+  - optionally guards and calls `save_project`.
 - `serialize.*`
-  - Converts `ProjectModel`, `Media`, `Sequence`, and `Clip` state to `QJsonObject`/`QJsonArray`.
-  - Never opens media, caches, renderers, or QRhi resources.
+  - serializes project, media, sequence, timeline, clips, and basic undo state;
+  - never opens media, starts caching, touches QRhi, or mutates model state.
 
-### Integrate with CMake
+### CMake integration
 
-Minimal change in `src/CMakeLists.txt`:
+In `src/CMakeLists.txt`:
 
-1. Add the automation sources to `UI_SOURCES` near `main.cpp` because they depend on UI globals and
-   `AmberGlobal`:
+1. Add `add_subdirectory(automation)` after existing `add_subdirectory(core)` /
+   `add_subdirectory(engine)` or near the executable setup.
+2. Make `src/automation/CMakeLists.txt` define a small object or static library, for example
+   `amber-automation`.
+3. Link or include that target into `${AMBER_TARGET}` only, not `amber-engine`, because automation
+   depends on app/UI globals and should not contaminate headless engine tests.
+4. Keep dependencies to Qt Core/Widgets already present through the app target.
 
-   ```cmake
-   automation/automationserver.cpp automation/automationserver.h
-   automation/commands.cpp automation/commands.h
-   automation/serialize.cpp automation/serialize.h
-   ```
+If the CMake target split creates linker friction, fallback is adding automation sources directly to
+`UI_SOURCES`. That is less clean but still acceptable for the first PR. Prefer the subdirectory because
+the full context explicitly asks for it and future agents will expect it.
 
-2. Do not add a new library target in the first PR. Adding a new CMake subdirectory is fine later,
-   but the initial path with the fewest linker surprises is compiling into the existing app target.
+### Startup changes in `src/main.cpp`
 
-No new `find_package()` entry is needed for JSON; Qt Core is already linked.
-
-### Modify startup
-
-Change `src/main.cpp` conservatively:
+Conservative edits:
 
 1. Add `bool automation_stdio = false;`.
 2. Add `--automation-stdio` to `print_help()`.
-3. Extend `handle_flag()` and `parse_args()` to set `automation_stdio`.
-4. Preserve every existing default path when the flag is absent.
-5. After `MainWindow w(nullptr)` and existing initialization wiring, construct and start
-   `AutomationServer` only if `automation_stdio` is true.
+3. Extend `handle_flag()` / `parse_args()` to set it.
+4. Preserve all existing behavior when absent.
+5. After `MainWindow w(nullptr)` and panel/app initialization, create `AutomationServer` only when the
+   flag is present.
 6. In automation mode:
-   - do not call `w.showMaximized()` or `w.showFullScreen()`;
-   - still create the `MainWindow`, panels, `AppContextImpl`, `MediaIconService`, etc.;
-   - explicitly schedule `amber::Global->finished_initialize()` with `QTimer::singleShot(0, ...)`
-     or rely on a direct initialization path, because `finished_first_paint` will not fire if the
-     window is never shown.
+   - still create `QApplication`, `MediaIconService`, `MainWindow`, panels, and app context;
+   - do not show the main window;
+   - explicitly queue `amber::Global->finished_initialize()` because `finished_first_paint` will not fire;
+   - ensure stdout remains protocol-only.
+7. In normal mode:
+   - keep `w.showFullScreen()` / `w.showMaximized()` behavior unchanged.
 
-The key review invariant is: without `--automation-stdio`, lines equivalent to current
-`w.showFullScreen()` / `w.showMaximized()` behavior still run unchanged.
+Do not add `--automation-headless` in PR 1. The context calls it optional later.
 
-### Startup readiness
+## First-PR tool behavior
 
-The server should not answer project-inspection calls until initialization has completed:
-
-- Track readiness after `AmberGlobal::finished_initialize()` has run.
-- For the first PR, if a request arrives before readiness, either:
-  - queue it until ready; or
-  - return a structured `not_ready` error.
-
-Prefer queueing only for `initialize`; tool calls can return `not_ready` until ready. This avoids
-hidden hangs in smoke tests.
-
-### JSON-RPC/MCP shape
-
-Use JSON-RPC 2.0 response envelopes:
-
-```json
-{"jsonrpc":"2.0","id":1,"result":{...}}
-{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}
-```
-
-Supported methods:
-
-- `initialize`
-  - returns protocol/server info and capabilities.
-- `tools/list`
-  - returns tool definitions with JSON-schema-like `inputSchema`.
-- `tools/call`
-  - accepts `{ "name": "...", "arguments": { ... } }`.
-
-For MCP compatibility, `tools/call` can return:
-
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "{\"project\":{...}}"
-    }
-  ]
-}
-```
-
-This is not the prettiest interface, but it is compatible and minimizes custom client assumptions.
-
-### Tool behavior
-
-#### `inspect_project` (read-only)
+### `inspect_project`
 
 Return:
 
-- app name/version string from `amber::AppName`
-- project filename from `amber::ActiveProjectFilename`
-- modified state from `amber::Global->is_modified()` or `amber::project_io->isModified()`
-- active sequence summary, if any
-- counts for root media items, sequences, and clips
-- undo/redo availability from `amber::UndoStack.canUndo()` / `canRedo()`
+- `amber::AppName`;
+- `amber::ActiveProjectFilename`;
+- modified state from `amber::Global->is_modified()` or `amber::project_io->isModified()`;
+- active sequence summary if `amber::ActiveSequence` exists;
+- counts for media, sequences, clips;
+- undo/redo availability from `amber::UndoStack.canUndo()` / `canRedo()`.
 
-#### `list_media` (read-only)
+### `list_media`
 
-Traverse `amber::project_model` using `childCount()` / `child()` and serialize:
+Traverse `amber::project_model` with `childCount()` / `child()` and return:
 
-- stable path/index within project tree
-- name
-- type: `footage`, `sequence`, or `folder`
-- for footage: URL/name and ready/error fields only if already exposed safely by `Footage`
-- for sequence: sequence summary only, not full timeline
+- stable tree path/index;
+- name;
+- type: `footage`, `sequence`, or `folder`;
+- footage URL/name/ready/error fields only when already safe and exposed;
+- sequence summary, not full timeline.
 
-#### `list_sequences` (read-only)
+### `list_sequences`
 
-Return all sequence media items from project traversal. Avoid depending on `panel_project` if possible,
-even though `Project::list_all_project_sequences()` exists (`src/panels/project.h:80`), because direct
-model traversal is simpler to test and has fewer UI-panel assumptions.
+Return all sequence media items from project traversal. Avoid depending on `panel_project` where direct
+model traversal is enough.
 
-#### `inspect_timeline` (read-only)
+### `inspect_timeline`
 
 Inputs:
 
-- optional sequence identifier/path; if omitted, inspect `amber::ActiveSequence`.
+- optional sequence path/id; if omitted, use `amber::ActiveSequence`.
 
 Return:
 
-- sequence properties (`name`, dimensions, frame rate, audio settings, playhead, work area)
-- clips with index, name, media reference, stream index, track, timeline in/out, clip in, enabled,
-  speed value, linked indexes, and transition presence
-- selections only if useful
+- sequence properties;
+- clips with index, name, media reference, media stream index, track, timeline in/out, clip in, enabled,
+  speed, linked indexes, transition presence;
+- selection summary if useful.
 
-Do not call `Clip::Open()`, `Clip::Cache()`, `Clip::Retrieve()`, `Clip::Close()`,
-`Clip::media_width()`, or `Clip::media_height()` unless already known safe for unloaded media.
+Do not call `Clip::Open()`, `Clip::Cache()`, `Clip::Retrieve()`, `Clip::Close()`, or inspect QRhi fields.
 
-#### `undo` / `redo` (mutation-class, existing global behavior)
+### `undo` and `redo`
 
 Call `AmberGlobal::undo()` and `AmberGlobal::redo()` on the GUI thread. Return:
 
-- whether the action was attempted
-- `canUndo` / `canRedo` after the call
-- current modified state
+- whether the call was attempted;
+- `canUndo` / `canRedo` after the call;
+- current modified state.
 
-These preserve existing behavior and UI refresh through `update_ui(true)`
-(`src/global/global.cpp:414-428`).
+These preserve existing behavior through `update_ui(true)` (`src/global/global.cpp:414-428`) and satisfy
+the two-mutation acceptance criterion without new edit semantics.
 
-#### `save_project` (optional guarded mutation)
+### Optional `save_project`
 
-If included, enforce:
+If included:
 
-- if `amber::ActiveProjectFilename.isEmpty()`, return an error like
-  `{"code":"project_has_no_filename","message":"save_project requires an existing project path"}`.
+- if `amber::ActiveProjectFilename.isEmpty()`, return a structured error such as
+  `project_has_no_filename`;
 - otherwise call `amber::Global->save_project()` on the GUI thread.
 
-Do not show a file dialog from automation.
+Do not let automation open a save dialog.
 
-## Threading and stdio implementation guidance
+## Threading and stdio guidance
 
-### Recommended first implementation
+The full context suggests an automation `QThread` with stdio reader/writer and GUI-thread dispatch.
+That is compatible with the repo, but the implementation must avoid two traps:
 
-Use a small background `std::thread` to read newline-delimited JSON from `std::cin`, then hand requests
-to the Qt event loop with `QMetaObject::invokeMethod()`.
+1. Stdin handling must not block the GUI thread.
+2. `Qt::BlockingQueuedConnection` must never be used from the GUI thread to itself.
 
-Why this is lower risk than `QSocketNotifier`:
+Recommended first implementation:
 
-- `QSocketNotifier` on stdin can differ across platforms and is awkward on Windows console handles.
-- A blocking reader thread keeps stdin handling independent from the GUI event loop.
-- Qt JSON parsing remains in-process with no dependency.
+- A dedicated automation thread (either `QThread` or a small `std::thread`) blocks on stdin.
+- It parses newline-delimited JSON or forwards raw lines for parsing.
+- It dispatches command execution to the GUI thread.
+- It writes responses under a mutex to stdout.
+- It joins/stops cleanly when stdin closes.
 
-Rules:
+GUI dispatch helper:
 
-- Never mutate Amber state directly from the reader thread.
-- Parse the JSON line in the reader thread or GUI thread, but execute all command handlers on the GUI
-  thread.
-- Serialize writes to stdout with a mutex.
-- Use newline-delimited JSON for request/response framing.
-- Do not log debug output to stdout in automation mode. stdout must be protocol-only.
+- if current thread is `qApp->thread()`, run directly;
+- otherwise use `QMetaObject::invokeMethod(..., Qt::BlockingQueuedConnection)` for fast commands;
+- return `task_id` immediately for future long tasks instead of blocking.
 
-### `invokeMethod` and blocking risk
-
-Avoid `Qt::BlockingQueuedConnection` from the GUI thread to itself; it deadlocks. A safe helper should:
-
-- if already on `qApp->thread()`, run the handler directly;
-- otherwise use `QMetaObject::invokeMethod(qApp, lambda, Qt::BlockingQueuedConnection)` only from the
-  reader thread.
-
-Alternatively use queued invocation and a promise/future. That avoids accidental self-deadlocks but
-requires more code.
-
-### Logger/stdout risk
-
-`main.cpp` installs `debug_message_handler` unless `--no-debug` is passed (`src/main.cpp:265`).
-The first PR must verify where that handler writes. In automation mode, force diagnostic output to
-stderr or the existing internal debug sink, never stdout. Protocol stdout corruption is a hard failure.
+All read-only inspection should also run on the GUI thread, because `ProjectModel`, `ActiveSequence`, and
+clip vectors are GUI-owned.
 
 ## README and smoke script
 
-### README changes
+### README
 
-Add a concise section to `README.md`:
+Add a short section covering:
 
-- `--automation-stdio` description
-- newline-delimited JSON-RPC example
-- warning that normal GUI launch is unchanged
-- list of first supported tools
-- note that media/timeline mutation and preview render tools are intentionally deferred
+- `--automation-stdio`;
+- JSON-RPC newline framing;
+- MCP methods implemented;
+- first supported tools;
+- normal GUI launch unchanged;
+- media/timeline/render mutations intentionally deferred.
 
-Keep this short; detailed protocol docs can follow once the API stabilizes.
-
-### Smoke script path
+### Smoke script
 
 Add:
 
 - `scripts/smoke_automation_stdio.py`
 
-The repository currently has no tracked `scripts/` directory. Creating one for this single smoke
-script is reasonable.
+Behavior:
 
-### Smoke script behavior
-
-The script should:
-
-1. Locate the built executable:
+1. Locate executable:
    - default `build/amber-editor` on Linux;
-   - allow override via `AMBER_BIN=/path/to/amber-editor`.
-2. Start with:
-   - `QT_QPA_PLATFORM=offscreen` where available, or document `xvfb-run` fallback;
-   - `AMBER_RHI_BACKEND=opengl` if needed for a deterministic local smoke.
-3. Launch:
+   - override with `AMBER_BIN=/path/to/amber-editor`.
+2. Launch:
    - `amber-editor --automation-stdio --no-debug`
-4. Send:
-   - `initialize`
-   - `tools/call` for `inspect_project`
-   - `tools/call` for `undo`
-5. Assert:
-   - valid JSON-RPC response envelopes;
-   - `inspect_project` contains expected keys;
-   - `undo` returns success or a clean no-op with `canUndo=false`.
-6. Terminate the process gracefully:
-   - prefer an automation `shutdown` method if implemented;
-   - otherwise close stdin and wait with a timeout, then terminate by process handle from Python.
+   - use `QT_QPA_PLATFORM=offscreen` or document `xvfb-run -a` fallback.
+3. Send JSON-RPC:
+   - `initialize`;
+   - `tools/list`;
+   - `tools/call` for `inspect_project`;
+   - `tools/call` for `undo`.
+4. Assert:
+   - each stdout line is valid JSON;
+   - responses have JSON-RPC envelopes;
+   - `inspect_project` includes expected keys;
+   - `undo` returns clean no-op or success with undo state.
+5. Close stdin and wait with timeout; terminate by Python process handle only if needed.
 
-Do not make the script require media files or GPU rendering.
+No media fixture, GPU rendering, or project file should be required for this first smoke.
 
 ## Local validation commands
 
-From repository root:
+From repo root:
 
 ```bash
 cmake -S src -B build -DCMAKE_BUILD_TYPE=Debug
@@ -473,154 +541,176 @@ ctest --test-dir build --output-on-failure
 python3 scripts/smoke_automation_stdio.py
 ```
 
-If the local machine lacks a display:
+If there is no display:
 
 ```bash
 QT_QPA_PLATFORM=offscreen python3 scripts/smoke_automation_stdio.py
 ```
 
-If offscreen is insufficient for Qt Widgets on a given runner:
+If Qt Widgets needs a virtual display:
 
 ```bash
 xvfb-run -a python3 scripts/smoke_automation_stdio.py
 ```
 
-The implementation PR should document which of those smoke paths was actually run.
+The PR should state exactly which smoke path was run.
 
 ## CI/build risks and mitigations
 
 ### Qt JSON
 
-Risk: none expected. `QJsonDocument`, `QJsonObject`, and `QJsonArray` are in Qt Core, already linked.
+Risk: low. Qt JSON types are in Qt Core, already linked.
 
-Mitigation: keep all JSON code Qt-native; do not add `nlohmann/json` or any package dependency.
+Mitigation: use Qt JSON only; do not add `nlohmann/json` or other dependencies.
 
-### Stdio transport
+### stdout protocol corruption
 
-Risk: stdout protocol corruption from existing logging or Qt warnings.
+Risk: high if Qt warnings or Amber logs write to stdout.
 
 Mitigation:
 
-- Require `--automation-stdio --no-debug` in smoke docs.
-- In automation mode, route protocol only to stdout and diagnostics to stderr/internal log.
-- Add test assertions that every stdout line is valid JSON.
+- smoke uses `--no-debug`;
+- automation writes protocol only to stdout;
+- diagnostics go to stderr or the existing internal debug sink;
+- smoke rejects non-JSON stdout lines.
 
 ### `QSocketNotifier` on stdin
 
 Risk: platform-specific behavior, especially Windows console handles.
 
-Mitigation: use a `std::thread` reader for the first PR. If `QSocketNotifier` is used later, keep it
-behind platform-specific tests.
+Mitigation: prefer a blocking reader in the automation thread for PR 1. If `QSocketNotifier` is used,
+test it on Linux and Windows packaging paths before relying on it.
 
-### `std::thread`
+### `QThread` / `std::thread` lifetime
 
-Risk: shutdown/lifetime bugs if the reader thread blocks after `QApplication` exits.
+Risk: blocked stdin thread outlives `QApplication`.
 
 Mitigation:
 
-- The server owns an atomic `running` flag.
-- Closing stdin should exit the read loop.
-- Destructor joins if joinable.
-- Smoke script closes stdin and waits for process exit.
+- server owns an atomic running flag;
+- closing stdin exits the read loop;
+- destructor joins/waits;
+- smoke closes stdin before process teardown.
 
-### `QMetaObject::invokeMethod` / blocking calls
+### `BlockingQueuedConnection`
 
-Risk: deadlock if `BlockingQueuedConnection` is used from GUI thread.
+Risk: self-deadlock if called from GUI thread.
 
-Mitigation: centralize GUI-thread dispatch in one helper that detects current thread before blocking.
+Mitigation: centralize GUI dispatch and detect current thread.
 
-### Hidden window automation mode
+### Hidden-window startup
 
-Risk: `finished_first_paint` will not fire if no window is shown, so project-on-launch initialization
-may never happen.
+Risk: `finished_first_paint` never fires, so launch-project initialization never runs.
 
-Mitigation: in automation mode, explicitly call or queue `AmberGlobal::finished_initialize()` after
-panel construction. Smoke test should cover `inspect_project` after startup.
+Mitigation: explicitly queue `AmberGlobal::finished_initialize()` in automation mode after app/panel
+construction.
 
-### Save command
+### `save_project`
 
-Risk: unsaved project opens a modal save dialog and hangs automation.
+Risk: modal save dialog hangs automation for unsaved projects.
 
-Mitigation: guard on `amber::ActiveProjectFilename.isEmpty()` before calling `save_project()`.
+Mitigation: guard on `amber::ActiveProjectFilename.isEmpty()`.
 
-### Import/media mutations
+### Media import
 
-Risk: `Project::process_file_list()` can prompt for `.ove` imports and triggers asynchronous media
-analysis (`PreviewGenerator::AnalyzeMedia()`), making smoke behavior timing-sensitive.
+Risk: `.ove` imports prompt; media analysis is asynchronous; imported media readiness is timing-sensitive.
 
-Mitigation: defer import to PR 2. When implemented, reject `.ove` first and return imported media IDs
-after the undo action is pushed.
+Mitigation: defer to PR 2. Initially reject `.ove` and return imported media identities after undo action
+push, not after analysis completes.
 
-### Add-clip/split/ripple mutations
+### Timeline mutations
 
-Risk: existing paths assume panel globals, viewer state, selections, and timeline ghosts. Direct use can
-silently bypass undo/redo or leave UI state inconsistent.
+Risk: panel globals, viewer seek, selections, timeline ghosts, and UI refresh can be bypassed or left
+inconsistent.
 
-Mitigation: defer until the automation harness exists. Implement only through existing `Timeline` and
-`Project` methods, with every mutation on the GUI thread and grouped in `ComboAction`.
+Mitigation: defer. When implemented, use existing `Timeline` methods on GUI thread and push `ComboAction`.
 
 ### Render preview
 
-Risk: render thread uses QRhi/offscreen resources and save-path behavior; timeout/cancel handling is
-not trivial.
+Risk: QRhi/offscreen resources, backend selection, failure signals, timeout, and cancellation.
 
-Mitigation: defer to a dedicated PR with one focused smoke script and a known tiny project/media fixture
-or generated sequence.
+Mitigation: defer to dedicated Phase 3 PR with its own smoke fixture.
 
 ## Rollback strategy
 
 The first PR should be easy to revert:
 
-- All new behavior is gated by `--automation-stdio`.
-- Normal launch code path remains the default.
-- New files live under `src/automation/`.
-- README and smoke script are additive.
-- CMake integration is a small `UI_SOURCES` addition.
+- all runtime behavior gated by `--automation-stdio`;
+- normal launch remains default;
+- automation code isolated under `src/automation/`;
+- README and smoke script additive;
+- no project format changes;
+- no persisted data migration;
+- only mutation tools are existing `undo`/`redo` and optional guarded save.
 
-If problems appear after merge:
+Rollback options:
 
-1. Revert the single automation PR.
-2. If a narrow hotfix is preferred, remove the `--automation-stdio` flag handling and automation source
-   entries from `src/CMakeLists.txt`; no project file format or runtime data migration is involved.
-3. Because first-PR mutations are limited to existing `undo`/`redo` and guarded `save_project`, no data
-   repair should be needed.
+1. Revert the automation PR.
+2. For a hotfix, remove `--automation-stdio` parsing, remove `add_subdirectory(automation)` or source
+   entries from CMake, and leave docs/scripts if desired.
+3. No data repair should be needed.
 
-## Later implementation checklist for Cursor agents
+## Later implementation order
 
-Use this checklist when implementing the first PR:
+1. **PR 1: stdio MCP substrate**
+   - `--automation-stdio`
+   - JSON-RPC/MCP initialize/tools/list/tools/call
+   - four read-only tools
+   - `undo` and `redo`
+   - optional guarded `save_project`
+   - README and smoke script
+2. **PR 2: safe project mutations**
+   - `import_media` via `AppContext::processFileList()` / `Project::process_file_list()`
+   - reject `.ove` initially
+   - `create_sequence` through `Project::create_sequence_internal()`
+3. **PR 3: timeline mutations**
+   - `add_clip` through ghost creation and `Timeline::add_clips_from_ghosts()`
+   - `move_clip` through `Clip::move(ComboAction*, ...)`
+   - `split_clip` through `Timeline::split_clip_and_relink()`
+   - `ripple_delete` through selection construction and `Timeline::delete_selection()`
+4. **PR 4: preview render**
+   - `render_preview_frame` through `RenderThread::start_render()` save path
+   - timeout, failure signal, cancellation
+5. **PR 5: external Cursor SDK runner**
+   - outside Amber
+   - treats Amber as stdio MCP server
+6. **PR 6+: compound workflows and sidecars**
+   - transcript/scene/silence/beat sidecars
+   - preview segment
+   - OTIO import/export
+   - project snapshots/branching
+   - social-video compound tools
 
-1. Confirm current branch is based on `2.0.lawmight`.
-2. Read `src/main.cpp`, `src/CMakeLists.txt`, and this assessment before editing.
-3. Add automation sources under `src/automation/`; do not touch `Clip::Cacher` or QRhi paths.
-4. Add `--automation-stdio` parsing without changing behavior for existing flags.
-5. Hide the window only in automation mode; preserve `showMaximized()` / `showFullScreen()` otherwise.
-6. Ensure automation startup reaches the same initialized state as normal launch.
-7. Keep stdout protocol-only.
-8. Run all command handlers on the GUI thread.
-9. Implement only read-only serialization plus `undo`/`redo` and optional guarded `save_project`.
-10. Validate command inputs and return structured JSON-RPC errors.
-11. Add README documentation and `scripts/smoke_automation_stdio.py`.
-12. Build locally:
+## Checklist for future Cursor agents
+
+Before editing:
+
+1. Confirm branch is `2.0.lawmight` or the requested feature branch based on it.
+2. Read this assessment, `src/main.cpp`, `src/CMakeLists.txt`, and the full agent context if available.
+3. Keep Cursor SDK external; do not embed model orchestration in Amber.
+
+During implementation:
+
+4. Add automation under `src/automation/` using the proposed layout.
+5. Keep stdout protocol-only.
+6. Run every command handler on the GUI thread.
+7. Run read-only inspection on the GUI thread too.
+8. Do not mutate `Sequence`, `Clip`, `ProjectModel`, or `UndoStack` from automation thread.
+9. Do not touch `Clip::Cacher`, QRhi textures, or render resources.
+10. Use `ComboAction` and `amber::UndoStack` for every real edit mutation.
+11. For first PR, implement only read-only tools plus `undo`/`redo`.
+12. Guard `save_project` if included.
+13. Preserve normal launch exactly when `--automation-stdio` is absent.
+
+Before submitting:
+
+14. Build:
     - `cmake -S src -B build -DCMAKE_BUILD_TYPE=Debug`
     - `cmake --build build -j$(nproc)`
-13. Run:
+15. Run:
     - `ctest --test-dir build --output-on-failure`
     - `python3 scripts/smoke_automation_stdio.py`
-14. Verify manual normal launch or at least a no-automation startup smoke remains unchanged.
-15. Do not add timeline/media mutation tools until the first PR has landed and the stdio harness is
-    trusted.
-
-## Recommended follow-up PR order
-
-1. **PR 1: stdio automation + read-only tools + undo/redo/guarded save.**
-2. **PR 2: safe project mutations.**
-   - `import_media`, rejecting `.ove` initially.
-   - `create_sequence` through `Project::create_sequence_internal()` and `ComboAction`.
-3. **PR 3: timeline mutations.**
-   - `add_clip` through ghost creation + `Timeline::add_clips_from_ghosts()`.
-   - `split_clip` through `Timeline::split_clip_and_relink()`.
-   - `ripple_delete` through selection construction + `Timeline::delete_selection()`.
-4. **PR 4: render preview frame.**
-   - `RenderThread::start_render()` with save path, timeout, failure signal, and cancellation.
-5. **PR 5: external Cursor SDK runner.**
-   - Keep outside Amber; treat Amber as a stdio MCP server.
+16. Confirm smoke covers `inspect_project` and one mutation tool.
+17. Confirm no non-JSON stdout in automation mode.
+18. Confirm no feature code for later phases slipped into PR 1.
+19. Document any environment-specific smoke fallback used (`offscreen` vs `xvfb-run`).
