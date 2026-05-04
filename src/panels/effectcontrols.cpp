@@ -315,6 +315,7 @@ void EffectControls::open_effect(QVBoxLayout* layout, Effect* e) {
   connect(container, &EffectUI::CutRequested, this, &EffectControls::cut);
   connect(container, &EffectUI::CopyRequested, this, [this]() { copy(); });
   connect(container, &EffectUI::deselect_others, this, &EffectControls::deselect_all_effects);
+  connect(container, &EffectUI::visibleChanged, this, [this]() { SyncLabelColumnWidth(); });
 
   open_effects_.append(container);
 
@@ -606,6 +607,21 @@ void EffectControls::Reload() {
   Load();
 }
 
+void EffectControls::SyncLabelColumnWidth() {
+  int max_w = 0;
+  for (EffectUI* ui : open_effects_) {
+    if (!ui->IsExpanded()) continue;
+    for (QLabel* lbl : ui->labels()) {
+      max_w = qMax(max_w, lbl->sizeHint().width());
+    }
+  }
+  for (EffectUI* ui : open_effects_) {
+    for (QLabel* lbl : ui->labels()) {
+      lbl->setMinimumWidth(max_w);
+    }
+  }
+}
+
 void EffectControls::SetClips()
 {
   if (amber::ActiveSequence == nullptr) {
@@ -712,6 +728,8 @@ void EffectControls::Load() {
 
   UpdateTitle();
   update_keyframes();
+
+  SyncLabelColumnWidth();
 }
 
 void EffectControls::video_effect_click() {

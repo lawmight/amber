@@ -107,6 +107,8 @@ private:
 
   void Load();
 
+  void SyncLabelColumnWidth();
+
   void DeleteEffect(ComboAction* ca, Effect* effect_ref);
 
   void show_effect_menu(int type, int subtype);

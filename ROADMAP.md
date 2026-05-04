@@ -9,17 +9,37 @@ Amber inherits Olive 0.1's greatest strength: everything is where you expect it.
 1.x receives bug fixes and security updates throughout 2.0 development. Once 2.0 is fully released, 1.x reaches end of life.
 
 
-### 1.6.0 — Quality-of-life
+### 1.6 — Shipped
 
-- ~~Auto Cut Silence ripple delete + configurable gap between clips, feedback dialogs when no cuts produced~~
-- Track Select Tool — new timeline tool, selects all clips from click point rightward on the track (Shift = all tracks) (#15)
-- Shift+Arrow multi-frame skip — bind Shift+Left/Right as alias for Jump Backward/Forward (existing `Ctrl+[`/`Ctrl+]`, configurable step in preferences) (#15)
+- ~~Auto Cut Silence ripple delete + configurable gap between clips, feedback dialogs when no cuts produced~~ (shipped in v1.5.3)
+- ~~Track Select Tool — selects all clips from click point rightward on the track (Shift = all tracks)~~ (shipped in v1.6.0, #15)
+- ~~Shift+Arrow multi-frame skip — alias for Jump Backward/Forward, configurable step in preferences~~ (shipped in v1.6.0, #15)
+- ~~Bold timecodes on viewer~~ (shipped in v1.6.0, #12)
+
+### 1.7 — Shipped
+
+- ~~Color labels on media — right-click in project panel → label color, tints the row + adds a swatch on the icon; applies to footage, sequences, and folders. View → Color Labels toggles visibility.~~ (shipped in v1.7.0)
+- ~~Text stroke on rich text effect — outline color + width, applies to the whole text via `QTextCharFormat::setTextOutline`.~~ (shipped in v1.7.0, #12)
+- ~~Effect controls alignment — label columns line up across all open effects in the Effect Controls panel.~~ (shipped in v1.7.0, #12)
+- ~~Gradient generator — 2-stop linear/radial, QPainter-based. Angle for linear; center X/Y + radius for radial.~~ (shipped in v1.7.0, #21)
+- ~~Turbulent displacement — single-octave simplex-noise UV warp shader effect. Amplitude X/Y + scale + evolution.~~ (shipped in v1.7.0, #35)
+- ~~Unified timeline (no video/audio split) — merged the `video_area` + `audio_area` widgets into a single `TimelineWidget` with one scrollbar. Track-id semantics (`<0` video, `>=0` audio) and `.ove` format unchanged. Drag-select now spans both sides naturally.~~ (shipped in v1.7.0, #38)
+- ~~Voice-over UX polish — live input VU meter while recording (`RecordingTap` `QIODevice` taps the audio stream and posts peaks to the existing AudioMonitor on the GUI thread). 3-second pre-roll countdown overlay before recording starts.~~ (shipped in v1.7.0, #39)
+
+### 1.8+ — Stretch goals (pending)
+
+Pulled out of 1.7.0 to ship cleanly; revisit for 1.8 or as the next milestone defines.
+
+- **Linked clip vertical drag** — V+A clips move together across tracks when dragging a linked pair, standard NLE behavior. (#12)
+- **Motion blur** — shutter-angle integration on animated transforms via keyframe sub-sampling at render time. Per-clip toggle + global default. Animation-driven only — true per-pixel motion vectors stays post-2.0. (#36)
+- **Hardware encoding export (NVENC, VAAPI, QSV)** — hwaccel decoding exists; expose FFmpeg encoder variants in the export dialog.
+
+### 1.x backlog (post-1.7)
+
 - **Canvas Painter for viewer overlays (Qt 6.11)** — replace QPainter with Qt Canvas Painter (GPU-accelerated 2D on QRhi, 2-10x faster) for title-safe, guides, gizmos. Drop-in API swap, same drawing logic. Tech preview — API may shift in 6.12.
 - **Callback-based audio I/O (Qt 6.11)** — `QAudioSink::start()` now accepts a callback for real-time audio processing, replacing QIODevice push/pull. Adopt for audio monitoring and scrub playback — cleaner, lower latency.
-- **Bold timecodes** — increase font weight on timecode displays (viewer, effect controls). Trivial QSS/font change. (#12)
 - **PipeWire Bluetooth audio** — Qt 6.11 ships a new PipeWire backend. Test if Bluetooth sink enumeration works; if so, remove the `QT_AUDIO_BACKEND=pulseaudio` workaround in `main.cpp`.
-
-
+- **Flatpak / Flathub release** — provide an official Flatpak manifest and publish to Flathub for tighter desktop integration on Linux (file portals, permissions). Complements the existing AppImage. Requires a Flathub account + ongoing manifest maintenance — likely a community contribution. (#41)
 
 ## 2.0
 
@@ -59,13 +79,11 @@ Amber 2.0 accepts fragment shaders written in ShaderToy format — the de facto 
 - Audio FFT input (`iChannel` of type audio)
 
 ### New built-in effects
-- Gradient generator — linear/radial with multi-stop color ramp, applicable to solids and text (#21)
 - Timer / countdown
 - Progress bar
 - Lift / gamma / gain (3-way color correction)
 - Color correction tool (curves, scopes — waveform, vectorscope, histogram)
 - Subtitle editor — dedicated floating window for bulk subtitle editing (import is shipped in 1.5.0, this is the full editing UI)
-- **Text stroke** — QPainterPath outline on rich text effect (#12)
 - **Built-in audio effects** — EQ (parametric), compressor, reverb, delay, chorus, limiter. Incremental — each effect is independent DSP. (#12)
 
 ### Scopes & monitoring
@@ -84,6 +102,9 @@ Backported from Oak, adapted to QRhi (originally GL-based):
 - Proxy toggle (switch proxy/full-res during playback without rebuild)
 - Markers with duration — range markers with in/out points, Premiere-style section marking (#15)
 - Effect presets save/load — serialize effect parameters, apply saved presets to clips (#15)
+- **Adjustment Layer** — non-destructive overlay clip on a video track; effects on it apply to all tracks visually beneath within its time range. Unlike nested sequences, it doesn't reorganize the timeline. Implementation: new medialess clip kind, branch in `compose_sequence()` feeding the running framebuffer as input texture (ping-pong buffer to avoid read/write hazard), "New > Adjustment Layer" UI, `.ove` serialization. ~2-4 days. (#32)
+- **Voice-over recording UX polish** — recording itself already works: dedicated record button on the timeline toolbar arms the Add Audio mode, then click on the timeline to choose a track / drag a region, Play starts recording, Stop saves a WAV next to the project and inserts a clip. Input device + mono/stereo configurable in Preferences. What's missing: a live input VU meter while armed/recording, optional pre-roll countdown. (#39)
+- **Audio waveform sync** — auto-align two or more audio clips by cross-correlation (FFT-based) to sync external mic with camera audio across multi-cam takes. Manual sync-by-marker as a fallback. Locks aligned clips together as a linked group. (#40)
 
 ### Rendering pipeline optimizations
 
@@ -117,6 +138,7 @@ The audio data race (`audio_ibuffer` read without lock) was fixed in 1.4.0. Rema
 - **Effect controls alignment** — align labels and values in a grid layout (labels left-aligned, values right-aligned with consistent weight). Touches `CollapsibleWidget` + `EffectRow` layout. (#12)
 - **Audio plugin parameters in EffectControls** — expose VST2 parameters as native EffectField rows instead of "open GUI" button only. Depends on plugin API exposing param metadata. (#12)
 - **Graph Editor improvements** — better curve editing UX, currently minimal on 0.1.x (#15)
+- **Compact timeline mode for small screens** — finer minimum on audio track height, optional collapsed-track display, denser timeline ruler. Useful on low-vertical-resolution laptops where the timeline currently eats too much screen space. (#38)
 
 ### .ove → .amb project format
 

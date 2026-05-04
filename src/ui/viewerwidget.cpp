@@ -34,10 +34,12 @@ extern "C" {
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QFile>
+#include <QFileInfo>
 #include <QPainter>
 #include <QPolygon>
 #include <QRegularExpression>
 #include <QScreen>
+#include <QStandardPaths>
 #include <QtMath>
 
 #include "global/config.h"
@@ -190,15 +192,23 @@ void ViewerWidget::save_frame() {
   fd.setNameFilter(
       "Portable Network Graphic (*.png);;JPEG (*.jpg);;Windows Bitmap (*.bmp);;Portable Pixmap (*.ppm);;X11 Bitmap "
       "(*.xbm);;X11 Pixmap (*.xpm)");
+  // Anchor the dialog to a stable absolute directory. Without this, native
+  // pickers (notably XFCE/GTK with sidebar shortcuts like "Desktop") can
+  // return a relative path, which then resolves against the app cwd
+  // (= project directory after a project load) instead of the user's choice.
+  fd.setDirectory(save_frame_last_dir_.isEmpty()
+                      ? QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)
+                      : save_frame_last_dir_);
 
   if (fd.exec()) {
-    QString fn = fd.selectedFiles().at(0);
+    QString fn = QFileInfo(fd.selectedFiles().at(0)).absoluteFilePath();
     QString selected_ext = fd.selectedNameFilter().mid(
         fd.selectedNameFilter().indexOf(QRegularExpression("\\*\\.[a-z][a-z][a-z]")) + 1, 4);
     if (!fn.endsWith(selected_ext, Qt::CaseInsensitive)) {
       fn += selected_ext;
     }
 
+    save_frame_last_dir_ = QFileInfo(fn).absolutePath();
     renderer->start_render(viewer->seq.get(), 1, fn);
   }
 }
@@ -355,7 +365,10 @@ void ViewerWidget::frame_update() {
     if (waveform) {
       update();
     } else {
-      bool scrubbing = !viewer->playing;
+      // Single-step actions (prev/next frame) request precise retrieval so the
+      // cacher uses the long-wait path and we don't show a stale closest-frame.
+      bool scrubbing = !viewer->playing && !viewer->precise_next_render_;
+      viewer->precise_next_render_ = false;
       renderer->start_render(viewer->seq.get(), viewer->get_playback_speed(),
                              nullptr, nullptr, 0, amber::CurrentConfig.preview_resolution_divider, scrubbing);
     }
@@ -1134,6 +1147,10 @@ void ViewerWidget::render(QRhiCommandBuffer *cb) {
   if (overlay_) overlay_->update();
 }
 
+void ViewerWidget::update_overlay() {
+  if (overlay_) overlay_->update();
+}
+
 // --- ViewerOverlay ---
 
 ViewerOverlay::ViewerOverlay(ViewerWidget* vw, QWidget* parent) : QWidget(parent), vw_(vw) {
@@ -1152,6 +1169,14 @@ void ViewerOverlay::paintEvent(QPaintEvent*) {
     vw_->draw_guides(p);
     if (vw_->gizmos != nullptr) {
       vw_->draw_gizmos(p);
+    }
+    if (vw_->viewer->preroll_seconds_left > 0) {
+      QFont f = p.font();
+      f.setPointSize(qMax(48, height() / 6));
+      f.setBold(true);
+      p.setFont(f);
+      p.setPen(QColor(255, 255, 255, 200));
+      p.drawText(rect(), Qt::AlignCenter, QString::number(vw_->viewer->preroll_seconds_left));
     }
   }
 }

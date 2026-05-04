@@ -89,6 +89,16 @@ Viewer::Viewer(QWidget* parent)
 
   recording_flasher.setInterval(500);
 
+  preroll_timer.setInterval(1000);
+  connect(&preroll_timer, &QTimer::timeout, this, &Viewer::preroll_tick);
+
+  // PreciseTimer is required on Windows for video pacing — the default
+  // CoarseTimer rounds to the OS scheduler tick (~15.6ms), so a 30fps timeline
+  // (interval 33ms) actually fires at 31ms or 47ms, producing visible periodic
+  // stutter. timeBeginPeriod(1) is only active while the timer runs (during
+  // playback). No-op on Linux/macOS.
+  playback_updater.setTimerType(Qt::PreciseTimer);
+
   connect(&playback_updater, &QTimer::timeout, this, &Viewer::timer_update);
   connect(&recording_flasher, &QTimer::timeout, this, &Viewer::recording_flasher_update);
   connect(horizontal_bar, &ResizableScrollBar::valueChanged, headers, &TimelineHeader::set_scroll);
@@ -330,19 +340,31 @@ void Viewer::go_to_in() {
 }
 
 void Viewer::previous_frame() {
-  if (seq != nullptr && seq->playhead > 0) seek(seq->playhead - 1);
+  if (seq != nullptr && seq->playhead > 0) {
+    precise_next_render_ = true;
+    seek(seq->playhead - 1);
+  }
 }
 
 void Viewer::next_frame() {
-  if (seq != nullptr) seek(seq->playhead + 1);
+  if (seq != nullptr) {
+    precise_next_render_ = true;
+    seek(seq->playhead + 1);
+  }
 }
 
 void Viewer::previous_frames() {
-  if (seq != nullptr) seek(qMax(0L, seq->playhead - amber::CurrentConfig.frame_skip_step));
+  if (seq != nullptr) {
+    precise_next_render_ = true;
+    seek(qMax(0L, seq->playhead - amber::CurrentConfig.frame_skip_step));
+  }
 }
 
 void Viewer::next_frames() {
-  if (seq != nullptr) seek(seq->playhead + amber::CurrentConfig.frame_skip_step);
+  if (seq != nullptr) {
+    precise_next_render_ = true;
+    seek(seq->playhead + amber::CurrentConfig.frame_skip_step);
+  }
 }
 
 void Viewer::go_to_out() {
@@ -427,8 +449,14 @@ void Viewer::play(bool in_to_out) {
   }
 
   reset_all_audio();
-  if (is_recording_cued() && !start_recording()) {
-    qCritical() << "Failed to record audio";
+
+  // Voice-over pre-roll: instead of recording immediately, show a 3-second
+  // countdown overlay so the user has time to settle before audio capture starts.
+  // preroll_tick() will invoke start_recording() once the countdown ends.
+  if (is_recording_cued()) {
+    preroll_seconds_left = 3;
+    preroll_timer.start();
+    viewer_widget->update_overlay();
     return;
   }
 
@@ -441,6 +469,27 @@ void Viewer::play(bool in_to_out) {
   timer_update();
 }
 
+void Viewer::preroll_tick() {
+  preroll_seconds_left--;
+  viewer_widget->update_overlay();
+  if (preroll_seconds_left <= 0) {
+    preroll_timer.stop();
+    if (!start_recording()) {
+      qCritical() << "Failed to record audio";
+      uncue_recording();
+      preroll_seconds_left = 0;
+      viewer_widget->update_overlay();
+      return;
+    }
+    playhead_start = seq->playhead;
+    playing = true;
+    SetAudioWakeObject(this);
+    set_playpause_icon(false);
+    start_msecs = QDateTime::currentMSecsSinceEpoch();
+    timer_update();
+  }
+}
+
 void Viewer::play_wake() {
   if (!playing) return;
   start_msecs = QDateTime::currentMSecsSinceEpoch();
@@ -449,6 +498,18 @@ void Viewer::play_wake() {
 }
 
 void Viewer::pause(bool clear_buffer) {
+  // If Stop is pressed during pre-roll countdown, cancel the cue cleanly.
+  // Recording was never started, so don't call stop_recording() — just clear the
+  // overlay state and uncue. No audio file to import either.
+  if (preroll_timer.isActive()) {
+    preroll_timer.stop();
+    preroll_seconds_left = 0;
+    uncue_recording();
+    set_playpause_icon(true);
+    viewer_widget->update_overlay();
+    return;
+  }
+
   playing = false;
   SetAudioWakeObject(nullptr);
   set_playpause_icon(true);

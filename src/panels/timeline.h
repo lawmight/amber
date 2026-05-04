@@ -41,6 +41,7 @@ enum CreateObjects : uint8_t {
   ADD_OBJ_TITLE,
   ADD_OBJ_SOLID,
   ADD_OBJ_BARS,
+  ADD_OBJ_GRADIENT,
   ADD_OBJ_TONE,
   ADD_OBJ_NOISE,
   ADD_OBJ_AUDIO
@@ -155,6 +156,9 @@ public:
 
   int GetTrackHeight(int track);
   void SetTrackHeight(int track, int height);
+
+  int SeamY();
+  void InvalidateSeamY() { seam_y_dirty_ = true; }
 
   // snapping
   bool snapping{true};
@@ -306,12 +310,13 @@ private:
 
   QVector<TimelineTrackHeight> track_heights;
 
-  QWidget* timeline_area;
-  TimelineWidget* video_area;
-  TimelineWidget* audio_area;
+  int seam_y_cache_{0};
+  bool seam_y_dirty_{true};
+
+  QWidget* timeline_area_widget;
+  TimelineWidget* timeline_area;
   QWidget* editAreas;
-  QScrollBar* videoScrollbar;
-  QScrollBar* audioScrollbar;
+  QScrollBar* verticalScrollbar;
   QPushButton* zoomInButton;
   QPushButton* zoomOutButton;
   QPushButton* recordButton;

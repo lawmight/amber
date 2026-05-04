@@ -74,6 +74,10 @@ class Viewer : public Panel {
   void play(bool in_to_out = false);
   void pause(bool clear_buffer = true);
   bool playing{false};
+  // One-shot hint set by single-step actions (arrow keys, prev/next frame buttons)
+  // so the next render fetches the exact frame instead of falling back to the
+  // scrubbing fast-bail path. Consumed (cleared) by ViewerWidget::frame_update().
+  bool precise_next_render_{false};
   long playhead_start;
   qint64 start_msecs;
   QTimer playback_updater;
@@ -84,6 +88,10 @@ class Viewer : public Panel {
   long recording_start;
   long recording_end;
   int recording_track;
+
+  // Pre-roll countdown state. Read by ViewerOverlay::paintEvent to draw the
+  // 3,2,1 countdown overlay before voice-over recording actually starts.
+  int preroll_seconds_left{0};
 
   void reset_all_audio();
   void update_parents(bool reload_fx = false, bool scrubbing = false);
@@ -127,6 +135,7 @@ class Viewer : public Panel {
   void update_playhead();
   void timer_update();
   void recording_flasher_update();
+  void preroll_tick();
   void resize_move(double d);
 
   void drag_video_only();
@@ -170,6 +179,7 @@ class Viewer : public Panel {
 
   bool cue_recording_internal{false};
   QTimer recording_flasher;
+  QTimer preroll_timer;
 
   long previous_playhead;
   int playback_speed{0};
