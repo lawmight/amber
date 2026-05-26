@@ -65,9 +65,6 @@ public:
   bool IsActiveAt(long timecode);
   bool IsSelected(bool containing = true);
 
-  bool IsPrewarmed() const { return cacher.IsPrewarmed(); }
-  void MarkPrewarmed() { cacher.MarkPrewarmed(); }
-
   const QColor& color() const;
   void set_color(int r, int g, int b);
   void set_color(const QColor& c);
@@ -150,7 +147,8 @@ public:
 
   // playback functions
   void Open();
-  void Cache(long playhead, bool scrubbing, QVector<Clip*> &nests, int playback_speed);
+  void Cache(long playhead, bool scrubbing, QVector<Clip*> &nests, int playback_speed,
+             bool nonblocking = false);
   bool Retrieve(QRhi* rhi, QRhiCommandBuffer* cb, ComposeSequenceParams* params);
   void Close(bool wait);
   bool IsOpen();

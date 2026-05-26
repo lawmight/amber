@@ -188,6 +188,11 @@ bool Cacher::openWorkerOpenCodec(Footage* m, const FootageStream* ms) {
     qCritical() << "Could not open codec";
     av_dict_free(&opts);
     avcodec_free_context(&codecCtx);
+    // codecCtx->hw_device_ctx (the ref'd copy) is freed by avcodec_free_context above; the
+    // Cacher member is a separate AVBufferRef we must release ourselves to avoid a leak.
+    if (hw_device_ctx) {
+      av_buffer_unref(&hw_device_ctx);
+    }
     avformat_close_input(&formatCtx);
     return false;
   }
@@ -201,6 +206,13 @@ void Cacher::openWorkerVideoFilter(const FootageStream* ms) {
     qWarning() << "Cacher::openWorkerVideoFilter: FootageStream is null";
     return;
   }
+  // Mark buffersrc params as not yet configured from a real frame. When hardware decoding is
+  // active, stream->codecpar->format advertises a hwaccel format (e.g. AV_PIX_FMT_VAAPI) which
+  // does not match the software pixel format produced by av_hwframe_transfer_data (NV12, P010,
+  // ...). We seed buffersrc with the stream's declared format here so configuration succeeds,
+  // then call av_buffersrc_parameters_set() on the first decoded frame in
+  // RetrieveFrameAndProcess() to lock the graph to the real frame layout.
+  buffersrc_params_set_ = false;
   char filter_args[512];
   snprintf(filter_args, sizeof(filter_args), "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
            stream->codecpar->width,
@@ -462,7 +474,6 @@ void Cacher::CacheWorker() {
 }
 
 void Cacher::CloseWorker() {
-  prewarmed_.store(false, std::memory_order_relaxed);
   retrieved_frame = nullptr;
   queue_.lock();
   queue_.clear();
@@ -551,7 +562,8 @@ void Cacher::Open()
   start((clip->track() < 0) ? QThread::HighPriority : QThread::TimeCriticalPriority);
 }
 
-void Cacher::Cache(long playhead, bool scrubbing, QVector<Clip*>& nests, int playback_speed)
+void Cacher::Cache(long playhead, bool scrubbing, QVector<Clip*>& nests, int playback_speed,
+                   bool nonblocking)
 {
 
   if (!is_valid_state_) {
@@ -612,7 +624,13 @@ void Cacher::Cache(long playhead, bool scrubbing, QVector<Clip*>& nests, int pla
   // Same pattern as start_render() for video.
   bool audio_scrub = (scrubbing && clip->track() >= 0);
 
-  if (wait_for_cacher_to_respond && !audio_scrub) {
+  // Prefetch path (issue #47): also fire-and-forget, so an upcoming-clip queue
+  // refill never blocks the render thread. Blocking here produced periodic
+  // ~30-frame stutters at every cut on slow iGPU machines (queue drain →
+  // blocking refill → drain → repeat).
+  bool blocking = wait_for_cacher_to_respond && !audio_scrub && !nonblocking;
+
+  if (blocking) {
     main_thread_lock_.lock();
     main_thread_woken_ = false;
   }
@@ -621,14 +639,14 @@ void Cacher::Cache(long playhead, bool scrubbing, QVector<Clip*>& nests, int pla
   wait_cond_.wakeAll();
 
   // wait for cacher to respond (video and audio playback only, not audio scrub)
-  if (wait_for_cacher_to_respond && !audio_scrub) {
+  if (blocking) {
     interrupt_ = true;
     if (!main_thread_woken_) {
       main_thread_wait_.wait(&main_thread_lock_, 2000);
     }
   }
 
-  if (wait_for_cacher_to_respond && !audio_scrub) {
+  if (blocking) {
     main_thread_lock_.unlock();
   }
 }

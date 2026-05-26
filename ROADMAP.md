@@ -26,6 +26,11 @@ Amber inherits Olive 0.1's greatest strength: everything is where you expect it.
 - ~~Unified timeline (no video/audio split) — merged the `video_area` + `audio_area` widgets into a single `TimelineWidget` with one scrollbar. Track-id semantics (`<0` video, `>=0` audio) and `.ove` format unchanged. Drag-select now spans both sides naturally.~~ (shipped in v1.7.0, #38)
 - ~~Voice-over UX polish — live input VU meter while recording (`RecordingTap` `QIODevice` taps the audio stream and posts peaks to the existing AudioMonitor on the GUI thread). 3-second pre-roll countdown overlay before recording starts.~~ (shipped in v1.7.0, #39)
 
+### 1.7.5 — Shipped
+
+- ~~Contrast slider added to the Hue/Saturation/Brightness color effect (alongside brightness, no longer buried in Color Correction).~~ (shipped in v1.7.5, #50)
+- ~~Unnest no longer overwrites adjacent tracks — track remap now anchors on the inner sequence's actual topmost track instead of assuming V1.~~ (shipped in v1.7.5, #48)
+
 ### 1.8+ — Stretch goals (pending)
 
 Pulled out of 1.7.0 to ship cleanly; revisit for 1.8 or as the next milestone defines.
@@ -40,6 +45,9 @@ Pulled out of 1.7.0 to ship cleanly; revisit for 1.8 or as the next milestone de
 - **Callback-based audio I/O (Qt 6.11)** — `QAudioSink::start()` now accepts a callback for real-time audio processing, replacing QIODevice push/pull. Adopt for audio monitoring and scrub playback — cleaner, lower latency.
 - **PipeWire Bluetooth audio** — Qt 6.11 ships a new PipeWire backend. Test if Bluetooth sink enumeration works; if so, remove the `QT_AUDIO_BACKEND=pulseaudio` workaround in `main.cpp`.
 - **Flatpak / Flathub release** — provide an official Flatpak manifest and publish to Flathub for tighter desktop integration on Linux (file portals, permissions). Complements the existing AppImage. Requires a Flathub account + ongoing manifest maintenance — likely a community contribution. (#41)
+- **Mouse wheel zoom in keyframe / effect controls timeline** — Ctrl+wheel currently zooms the main timeline; same gesture should work inside the keyframe view and effect controls timeline. Small UX fix. (#51)
+- **External editors integration per media type** — right-click → "Open in external editor" with a per-MIME-type editor mapping in Preferences (e.g. images → GIMP, audio → Audacity). Re-imports automatically on file change. (#55)
+- **UI scaling / accessibility** — global font-size multiplier in Preferences for users on high-DPI screens or with vision needs. Qt's `setApplicationFont()` + per-widget icon size setting. (#54)
 
 ## 2.0
 
@@ -82,9 +90,15 @@ Amber 2.0 accepts fragment shaders written in ShaderToy format — the de facto 
 - Timer / countdown
 - Progress bar
 - Lift / gamma / gain (3-way color correction)
-- Color correction tool (curves, scopes — waveform, vectorscope, histogram)
+- **Tone Curve** — graphical curve editor (input → output mapping) with RGB / Luma / R / G / B modes, custom 2D widget + LUT texture shader. Complementary to the 3-way corrector. (#59)
+- **Alpha Mask (image source)** — masking effect that takes a PNG/SVG file as alpha source, with invert / feather / opacity / blend controls. Covers text reveals, shape stencils, static masks. Track-based variant (mask = clip on adjacent track) deferred — see Future. (#61)
+- Color correction tool (scopes — waveform, vectorscope, histogram)
 - Subtitle editor — dedicated floating window for bulk subtitle editing (import is shipped in 1.5.0, this is the full editing UI)
 - **Built-in audio effects** — EQ (parametric), compressor, reverb, delay, chorus, limiter. Incremental — each effect is independent DSP. (#12)
+- **Layered media import (SVG / XCF / KRA / PSD)** — import layered source files as a media type, with each top-level layer/group exposed as a separately animatable clip on its own track (Photoshop → After Effects-style workflow). v1: SVG only (`<g>` groups via Qt's `QSvgRenderer`, already linked). v2: GIMP `.xcf` and Krita `.kra` (KRA = ZIP of merged-layer PNGs, easy; XCF needs a parser — possibly via `libgimp` or a Qt port). PSD via QImage plugin. Per-layer transparency + blend mode preserved. SVG keeps vector-precision at any zoom. (#52)
+
+### Editing features (continued)
+- **Adjustable V/A divider in the unified timeline** — restore a draggable divider between video and audio regions, matching original Olive UX. Dropped in 1.7.0's unified timeline rework; revisit as a togglable preference if it can land without re-introducing the maintenance overhead of the old split widgets. (#49)
 
 ### Scopes & monitoring
 
@@ -130,6 +144,7 @@ The audio data race (`audio_ibuffer` read without lock) was fixed in 1.4.0. Rema
 
 ### Export improvements
 - Hardware encoding (NVENC, VAAPI, QSV) — hwaccel decoding exists, expose FFmpeg encoder variants in export dialog
+- **Per-codec options panel** — generalize the export dialog so each codec declares its own parameter set instead of one-off field additions. Concrete asks driving the redesign (#58): x264/x265 `-preset` (veryslow→ultrafast), SVT-AV1 (preset −2..13, CRF 0..63), rav1e (`-speed` −1..10, `-qp` 0..255), libaom-av1, AV1 2-pass encoding, average-bitrate as a compression mode for x264/x265/SVT-AV1/rav1e, FLAC compression levels, `+faststart` movflag for MOV-family containers (MP4/MOV/3GPP/FLV), per-codec pixel format filtering.
 - Render queue — non-modal export with queue UI, continue editing during render
 - Batch export — multi-sequence export in one operation
 
@@ -152,3 +167,5 @@ Features that require major architectural work or are outside the current scope.
 - **2.5D compositing** — per-layer Z-depth with perspective camera. Requires 3D projection matrix in `compose_sequence()`, Z-order per clip, camera node. Major architectural change. (#12)
 - **Text animation** — letter-by-letter, word-by-word, line-by-line transforms + typewriter effect. Requires a mini animation engine within the text effect. (#12)
 - **2.5D motion tracker** — point/planar tracking with compositing integration. Requires optical flow or feature matching (CPU-bound). (#12)
+- **AI-based video upscaling** — model-driven upscale (Real-ESRGAN, Anime4K class). Conflicts with Amber's lightweight footprint (sub-3 MB binary, ~70 MB idle RAM) — would pull in PyTorch/ONNX/ncnn runtime. Realistically a separate companion tool that pre-processes media into an upscaled file Amber imports normally, rather than an in-app effect. (#53)
+- **Track-based alpha mask** — extension of the 2.0 image-source Alpha Mask: use a clip on the adjacent track as a dynamic alpha source (animated masks, video-as-mask). Requires reordering `compose_sequence()` so the mask clip renders into its own buffer without being drawn to the final target, plus a per-clip "is-mask" flag, plus edge-case handling (mask not active at playhead, effects on the mask, dimension mismatch). Revisit if demand confirms after 2.0 ships. (#61)

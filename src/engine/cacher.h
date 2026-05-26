@@ -165,8 +165,17 @@ class Cacher : public QThread {
    * @param playback_speed
    *
    * The current playback speed (controlled by Shuttle Left/Stop/Right)
+   *
+   * @param nonblocking
+   *
+   * **TRUE** to fire-and-forget: wake the cacher and return immediately, never block on
+   * the cacher response. Used by the prefetch path in composite_video_clip when the
+   * playhead hasn't reached the clip yet (issue #47): blocking the render thread to wait
+   * for an upcoming-clip queue refill produced periodic stutters at every cut on slow
+   * iGPU machines (~30-frame cycle = queue drain → blocking refill → drain again).
    */
-  void Cache(long playhead, bool scrubbing, QVector<Clip*>& nests, int playback_speed);
+  void Cache(long playhead, bool scrubbing, QVector<Clip*>& nests, int playback_speed,
+             bool nonblocking = false);
 
   /**
    * @brief Retrieve frame requested by Cache()
@@ -197,10 +206,6 @@ class Cacher : public QThread {
    * the Clip is being closed specifically to make changes to it.
    */
   void Close(bool wait_for_finish);
-
-  // See prewarmed_ for semantics.
-  bool IsPrewarmed() const { return prewarmed_.load(std::memory_order_relaxed); }
-  void MarkPrewarmed() { prewarmed_.store(true, std::memory_order_relaxed); }
 
   /**
    * @brief Interrupt and reset audio state
@@ -436,6 +441,19 @@ class Cacher : public QThread {
    * Raw decoded frames are added to this for conversion/filtering
    */
   AVFilterContext* buffersrc_ctx{nullptr};
+
+  /**
+   * @brief Whether buffersrc parameters have been set from an actual decoded frame
+   *
+   * Reset to false in openWorkerVideoFilter(). When false, the first frame pushed
+   * into buffersrc_ctx will call av_buffersrc_parameters_set() with the frame's
+   * actual format/dimensions/SAR so the filter graph reconfigures correctly. This
+   * is required for hardware-accelerated decoding paths where the stream codecpar
+   * format does not match the post-transfer software pixel format (e.g. VAAPI HEVC
+   * landing as NV12 after hwframe transfer while codecpar advertises a hwaccel
+   * format).
+   */
+  bool buffersrc_params_set_{false};
 
   /**
    * @brief FFmpeg buffer sink
@@ -724,11 +742,6 @@ class Cacher : public QThread {
    * @brief Internal function using the Cacher's known information to determine whether this media is playing in reverse
    */
   bool IsReversed();
-
-  // Set true after the first pre-decode at the start of an open cycle.
-  // Prevents repeated pre-decodes that would steal iGPU decode bandwidth from
-  // the currently-playing clip (see issue #43 fix). Reset in CloseWorker().
-  std::atomic<bool> prewarmed_{false};
 };
 
 #endif  // CACHER_H
